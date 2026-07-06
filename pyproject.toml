@@ -1,0 +1,24 @@
+[project]
+name = "plan-execute-vs-react"
+version = "0.1.0"
+description = "Plan-and-Execute ile ReAct ajanlarının performans analizi"
+requires-python = ">=3.10"
+dependencies = [
+    "langgraph>=0.2.50",
+    "langchain>=0.3.0",
+    "langchain-core>=0.3.0",
+    # Self-hosted LLM OpenAI-uyumlu endpoint üzerinden ChatOpenAI ile bağlanır
+    "langchain-openai>=0.2.0",
+    # Executor'ın kullanacağı örnek araçlar
+    "langchain-community>=0.3.0",
+    "duckduckgo-search>=6.0.0",
+    "numexpr>=2.10.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/plan_execute"]
