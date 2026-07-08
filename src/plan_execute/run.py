@@ -1,4 +1,8 @@
-"""Plan-Execute grafiğini komut satırından çalıştırma girişi.
+"""Plan-Execute grafiğini komut satırından (canlı stream) çalıştırma girişi.
+
+Bu, grafiğin adım adım nasıl ilerlediğini görmek içindir (planner → executor →
+replanner). Metrik toplamak için ``main.py`` veya ``test/test_plan_execute_agent.py``
+kullan.
 
 Kullanım:
     uv run python -m plan_execute.run "Görev metni burada"
@@ -6,23 +10,19 @@ Kullanım:
 
 from __future__ import annotations
 
-import asyncio
 import sys
 
 from plan_execute.graph import build_plan_execute_graph
 
-DEFAULT_TASK = (
-    "2024 Avrupa Futbol Şampiyonası'nı kazanan takımın kaptanı kimdi ve "
-    "o oyuncunun yaşının karekökü kaçtır?"
-)
+DEFAULT_TASK = "Can Öztürk'ün Ardıldeks skoru kaçtır?"
 
 
-async def main(task: str) -> None:
+def main(task: str) -> None:
     graph = build_plan_execute_graph()
     config = {"recursion_limit": 50}
 
     print(f"\n=== GÖREV ===\n{task}\n")
-    async for event in graph.astream({"input": task}, config=config):
+    for event in graph.stream({"input": task}, config=config):
         for node, update in event.items():
             print(f"--- [{node}] ---")
             if "plan" in update:
@@ -38,4 +38,4 @@ async def main(task: str) -> None:
 
 if __name__ == "__main__":
     task = " ".join(sys.argv[1:]) or DEFAULT_TASK
-    asyncio.run(main(task))
+    main(task)

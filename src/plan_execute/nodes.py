@@ -22,6 +22,8 @@ uzun görevlerde daha tutarlı olur — ölçeceğimiz şey tam olarak bu.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 from langgraph.prebuilt import create_react_agent
 
 from plan_execute.config import get_llm
@@ -30,25 +32,36 @@ from plan_execute.schemas import Act, Plan, Response
 from plan_execute.state import PlanExecute
 from plan_execute.tools import get_tools
 
-# --- Executor: adımları yürüten ReAct alt-ajanı ------------------------------
-# Not: Burada tek bir adımı yürütmek için ReAct kullanıyoruz. ReAct'in kendisiyle
-# karşılaştırma yaparken bunu ayrı bir grafik olarak da çalıştıracağız.
-_executor_agent = create_react_agent(get_llm(), get_tools())
-
-# --- Planner: structured output ile plan üretir ------------------------------
-_planner = PLANNER_PROMPT | get_llm().with_structured_output(Plan)
-
-# --- Replanner: devam mı bitiş mi kararını verir -----------------------------
-_replanner = REPLANNER_PROMPT | get_llm().with_structured_output(Act)
+# LLM/ajan nesneleri TEMBEL (lazy) kurulur: modül import edilirken değil, ilk
+# kullanımda. Böylece paketi HF_TOKEN olmadan import etmek çökmez (token yalnızca
+# gerçekten çalıştırılırken gerekir) ve main.py dostça hata mesajını basabilir.
 
 
-async def plan_step(state: PlanExecute) -> dict:
+@lru_cache(maxsize=1)
+def _get_executor_agent():
+    """Adımları yürüten ReAct alt-ajanı (create_react_agent)."""
+    return create_react_agent(get_llm(), get_tools())
+
+
+@lru_cache(maxsize=1)
+def _get_planner():
+    """Structured output ile plan üreten planner zinciri."""
+    return PLANNER_PROMPT | get_llm().with_structured_output(Plan)
+
+
+@lru_cache(maxsize=1)
+def _get_replanner():
+    """Devam mı bitiş mi kararını veren replanner zinciri."""
+    return REPLANNER_PROMPT | get_llm().with_structured_output(Act)
+
+
+def plan_step(state: PlanExecute) -> dict:
     """Görev için ilk planı üretir."""
-    plan = await _planner.ainvoke({"messages": [("user", state["input"])]})
+    plan = _get_planner().invoke({"messages": [("user", state["input"])]})
     return {"plan": plan.steps}
 
 
-async def execute_step(state: PlanExecute) -> dict:
+def execute_step(state: PlanExecute) -> dict:
     """Plandaki ilk adımı ReAct alt-ajanıyla yürütür."""
     plan = state["plan"]
     plan_str = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(plan))
@@ -57,16 +70,16 @@ async def execute_step(state: PlanExecute) -> dict:
         f"Şu plan için:\n{plan_str}\n\n"
         f"1. adımı yürütmen isteniyor: {task}"
     )
-    agent_response = await _executor_agent.ainvoke(
+    agent_response = _get_executor_agent().invoke(
         {"messages": [("user", task_prompt)]}
     )
     result = agent_response["messages"][-1].content
     return {"past_steps": [(task, result)]}
 
 
-async def replan_step(state: PlanExecute) -> dict:
+def replan_step(state: PlanExecute) -> dict:
     """Sonuçlara göre planı günceller veya nihai cevabı üretir."""
-    output = await _replanner.ainvoke(state)
+    output = _get_replanner().invoke(state)
     if isinstance(output.action, Response):
         return {"response": output.action.response}
     return {"plan": output.action.steps}
