@@ -30,3 +30,29 @@ class Act(BaseModel):
             "Hedefe ulaşmak için daha fazla araç kullanımı gerekiyorsa Plan kullan."
         )
     )
+
+
+class PlannerDecision(BaseModel):
+    """Planner'ın triyaj kararı: görev araç gerektiriyorsa plan adımları, aksi
+    halde (kapsam dışı/selamlama/netleştirme) doğrudan cevap.
+
+    Union yerine AÇIK alanlar kullanılır: model bazen union branch'ini karıştırıp
+    yanıt alanına etiket ('PLAN') yazıyordu; bool + ayrı alanlar bunu önler.
+    """
+
+    needs_tools: bool = Field(
+        description=(
+            "Görev güncel/olgusal veri, hesaplama ya da araç gerektiriyor mu? "
+            "Fiyat/temel veri/rasyo/gelir tablosu/analist/teknik/haber/web/grafik/"
+            "hesaplama → true. Kapsam dışı istek (emir verme, alım-satım, kişisel "
+            "yatırım tavsiyesi), selamlaşma ya da netleştirme gereken muğlak soru → false."
+        )
+    )
+    steps: List[str] = Field(
+        default_factory=list,
+        description="needs_tools=true ise doğru sırada, ayrı ayrı yürütülebilir plan adımları (aksi halde boş).",
+    )
+    direct_answer: str = Field(
+        default="",
+        description="needs_tools=false ise kullanıcıya kısa, doğrudan cevap (aksi halde boş).",
+    )

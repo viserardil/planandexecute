@@ -9,9 +9,17 @@ dependencies = [
     # Model, HF Router üzerinden OpenAI-uyumlu endpoint ile ChatOpenAI ile bağlanır
     # (ReAct tarafıyla aynı sağlayıcı — adil karşılaştırma).
     "langchain-openai>=0.2.0",
-    # Executor'ın web_arama aracı için (ReAct tarafıyla aynı).
-    "tavily-python>=0.5.0",
     "python-dotenv>=1.0.0",
+    # Ortak finans araçları (react_scratch ile birebir aynı tools.py):
+    "yfinance>=0.2.40",      # borsa araçları
+    "matplotlib>=3.8.0",     # visualize_data / plot_chart
+    "requests>=2.31.0",      # web_search (Tavily REST)
+    # Eval koşucusu (test/test.py):
+    "datasets>=2.19.0",      # HuggingFace dataset yükleme
+    "jsonschema>=4.21.0",    # a.json v2.0.0 şema doğrulama (--validate)
+    # Sohbet UI sunucusu (app.py + index.html):
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
 ]
 
 [build-system]

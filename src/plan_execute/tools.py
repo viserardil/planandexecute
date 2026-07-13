@@ -1,290 +1,545 @@
-"""Executor ajanının kullanacağı araçlar (tools).
+"""
+Araçlar (tools) — agent'ın dış dünyaya "eylem" (Act) yapabildiği fonksiyonlar.
 
-ADİL karşılaştırma için bu araçlar ReAct projesindeki ``src/tools.py`` ile
-BİREBİR aynı davranışa sahiptir (aynı hesap makinesi, aynı Ardıldeks formülü,
-aynı persona SQLite veritabanı, aynı Tavily + disk cache web araması). Tek fark:
-burada executor bir LangGraph ``create_react_agent`` alt-ajanı olduğu için
-araçlar LangChain ``@tool`` nesneleri olarak sarmalanır; iç mantık aynıdır.
-
-Web araması sonuçları diske cache'lenir ve cache dizini ReAct projesinden
-kopyalanmıştır; böylece iki mimari aynı sorguya aynı web gözlemini görür ve
-tek değişken mimari kalır.
+Her araç basit bir Python fonksiyonudur: string girdi alır, string çıktı verir.
+Bir kayıt (registry) ile isimlerini agent'a tanıtırız. Yeni bir yetenek eklemek
+= yeni bir fonksiyon yazıp @tool ile kaydetmek. Agent kodu değişmez.
 """
 
-from __future__ import annotations
-
 import ast
-import hashlib
-import math
+import logging
 import operator
 import os
-import re
-import sqlite3
-from pathlib import Path
-from typing import Any
+import urllib.parse
+import requests
 
-from langchain_core.tools import tool
+# yfinance geçersiz sembolde konsola 404/uyarı basar; bunu susturuyoruz
+# (araçlar zaten temiz bir hata mesajı döndürüyor).
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+# İsim -> araç bilgisi haritası. Agent bu sözlüğe bakarak araçları bulur.
+TOOLS = {}
+
+
+def tool(name, description):
+    """Bir fonksiyonu araç olarak kaydeden dekoratör."""
+    def wrapper(func):
+        TOOLS[name] = {"func": func, "description": description}
+        return func
+    return wrapper
+
 
 # --- Güvenli hesap makinesi -------------------------------------------------
-# eval() yerine AST tabanlı, yalnızca aritmetik ifadelere izin veren yorumlayıcı.
-
-_ALLOWED_OPERATORS = {
+# eval() TEHLİKELİDİR (rasgele kod çalıştırır). Bunun yerine ifadeyi AST'ye
+# çevirip yalnızca izin verdiğimiz matematik operatörlerini yürütüyoruz.
+_OPERATORS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
     ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv,
-    ast.Mod: operator.mod,
     ast.Pow: operator.pow,
+    ast.Mod: operator.mod,
     ast.USub: operator.neg,
     ast.UAdd: operator.pos,
 }
 
-_ALLOWED_FUNCS = {
-    "sqrt": math.sqrt,
-    "log": math.log,
-    "sin": math.sin,
-    "cos": math.cos,
-    "tan": math.tan,
-    "abs": abs,
-    "round": round,
-    "min": min,  # skoru alt sınıra kırpmak için: max(1, ...)
-    "max": max,  # skoru üst sınıra kırpmak için: min(1900, ...)
-}
 
-
-def _safe_eval(node: ast.AST) -> float:
-    if isinstance(node, ast.Constant):  # sayılar
+def _safe_eval(node):
+    if isinstance(node, ast.Expression):
+        return _safe_eval(node.body)
+    if isinstance(node, ast.Constant):  # sayı sabiti
         if isinstance(node.value, (int, float)):
             return node.value
-        raise ValueError("yalnızca sayı sabitlerine izin var")
-    if isinstance(node, ast.BinOp):
-        return _ALLOWED_OPERATORS[type(node.op)](
-            _safe_eval(node.left), _safe_eval(node.right)
-        )
-    if isinstance(node, ast.UnaryOp):
-        return _ALLOWED_OPERATORS[type(node.op)](_safe_eval(node.operand))
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-        fn = _ALLOWED_FUNCS.get(node.func.id)
-        if fn is None:
-            raise ValueError(f"izin verilmeyen fonksiyon: {node.func.id}")
-        return fn(*[_safe_eval(a) for a in node.args])
-    raise ValueError("izin verilmeyen ifade")
+        raise ValueError("Sadece sayılar desteklenir")
+    if isinstance(node, ast.BinOp):     # a + b gibi ikili işlem
+        return _OPERATORS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+    if isinstance(node, ast.UnaryOp):   # -a gibi tekli işlem
+        return _OPERATORS[type(node.op)](_safe_eval(node.operand))
+    raise ValueError("İzin verilmeyen ifade")
 
 
-def _calculator(expression: str) -> str:
-    tree = ast.parse(expression.strip(), mode="eval")
-    result = _safe_eval(tree.body)
-    return f"{result}"
-
-
-# --- Ardıldeks skor formülü -------------------------------------------------
-# Gerçek KKB firma bilgisi burada TUTULMAZ; o sorular canlı web_arama ile
-# cevaplanır. Burada yalnızca Ardıldeks skorunun (sentetik, bize ait bir indeks)
-# hesaplama tanımı var.
-
-_KKB_BILGI: list[dict[str, Any]] = [
-    {
-        "anahtarlar": ["ardildeks", "ardıldeks", "skor formülü", "skor nasıl", "not hesaplama", "algoritma"],
-        "cevap": (
-            "Ardıldeks skoru (1-1900) şu formülle hesaplanır:\n"
-            "Skor = 300 + odeme_gecmisi*12 + (1 - borc_kullanim_orani)*250 "
-            "+ en_eski_hesap_yili*15 - karsiliksiz_cek*200 - aktif_kredi_sayisi*10\n"
-            "Sonuç 1 ile 1900 arasına kırpılır (clamp). Bileşenler 'personalar' "
-            "tablosundaki sütunlardır; kişiye ait değerleri sql_sorgu ile çekip "
-            "calculator ile hesapla."
-        ),
-    },
-]
-
-
-def _kkb_bilgi(query: str) -> str:
-    q = query.lower().strip()
-    words = [w for w in re.findall(r"[\wçğıöşü]+", q) if len(w) > 2]
-
-    best = None
-    best_score = 0
-    for entry in _KKB_BILGI:
-        keys = " ".join(entry["anahtarlar"]).lower()
-        score = sum(1 for w in words if w in keys)
-        # tam anahtar ifadesi geçiyorsa güçlü eşleşme
-        score += sum(2 for k in entry["anahtarlar"] if k in q)
-        if score > best_score:
-            best_score = score
-            best = entry
-
-    if best is None or best_score == 0:
-        return "Bu konuda KKB bilgi tabanında kayıt yok."
-    return best["cevap"]
-
-
-# --- KKB persona veritabanı (SQLite) ---------------------------------------
-# Ardıldeks ham bileşenleri burada; skor SAKLANMAZ, hesaplattırılır.
-
-_PERSONALAR: list[dict[str, Any]] = [
-    {"id": 1, "ad": "Ardıl Deniz Sustam", "odeme_gecmisi": 95, "borc_kullanim_orani": 0.20,
-     "karsiliksiz_cek": 0, "aktif_kredi_sayisi": 2, "en_eski_hesap_yili": 8,
-     "toplam_borc": 145000, "gecikmis_borc": 0},
-    {"id": 2, "ad": "Zeynep Kaya", "odeme_gecmisi": 70, "borc_kullanim_orani": 0.65,
-     "karsiliksiz_cek": 1, "aktif_kredi_sayisi": 4, "en_eski_hesap_yili": 5,
-     "toplam_borc": 320000, "gecikmis_borc": 45000},
-    {"id": 3, "ad": "Mehmet Demir", "odeme_gecmisi": 88, "borc_kullanim_orani": 0.30,
-     "karsiliksiz_cek": 0, "aktif_kredi_sayisi": 1, "en_eski_hesap_yili": 10,
-     "toplam_borc": 60000, "gecikmis_borc": 0},
-    {"id": 4, "ad": "Elif Yılmaz", "odeme_gecmisi": 45, "borc_kullanim_orani": 0.90,
-     "karsiliksiz_cek": 3, "aktif_kredi_sayisi": 5, "en_eski_hesap_yili": 3,
-     "toplam_borc": 510000, "gecikmis_borc": 120000},
-    {"id": 5, "ad": "Can Öztürk", "odeme_gecmisi": 100, "borc_kullanim_orani": 0.05,
-     "karsiliksiz_cek": 0, "aktif_kredi_sayisi": 3, "en_eski_hesap_yili": 15,
-     "toplam_borc": 30000, "gecikmis_borc": 0},
-]
-
-
-def _build_persona_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE personalar ("
-        "id INTEGER, ad TEXT, odeme_gecmisi INTEGER, borc_kullanim_orani REAL, "
-        "karsiliksiz_cek INTEGER, aktif_kredi_sayisi INTEGER, en_eski_hesap_yili INTEGER, "
-        "toplam_borc REAL, gecikmis_borc REAL)"
-    )
-    conn.executemany(
-        "INSERT INTO personalar VALUES (:id, :ad, :odeme_gecmisi, :borc_kullanim_orani, "
-        ":karsiliksiz_cek, :aktif_kredi_sayisi, :en_eski_hesap_yili, :toplam_borc, :gecikmis_borc)",
-        _PERSONALAR,
-    )
-    conn.commit()
-    return conn
-
-
-def _sql_sorgu(query: str) -> str:
-    q = query.strip().rstrip(";").strip()
-    if not q.lower().startswith("select"):
-        return "HATA: yalnızca SELECT sorgularına izin var."
-
-    conn = _build_persona_db()
+@tool("calculator", "Matematiksel ifadeyi hesaplar. Girdi: '2 * (3 + 4)' gibi.")
+def calculator(expr):
     try:
-        cursor = conn.execute(q)
-        rows = cursor.fetchall()
-        headers = [d[0] for d in cursor.description]
-    except Exception as exc:
-        return f"HATA: SQL çalıştırılamadı: {exc}"
-    finally:
-        conn.close()
+        tree = ast.parse(expr, mode="eval")
+        return str(_safe_eval(tree))
+    except Exception as e:
+        return f"Hesaplama hatası: {e}"
 
-    if not rows:
-        return "Sonuç bulunamadı."
-    lines = [" | ".join(headers)]
-    lines.extend(" | ".join(str(value) for value in row) for row in rows)
+
+
+
+@tool("web_search", "Güncel bilgi için web'de arama yapar (Tavily). Girdi: arama sorgusu, ör. 'en son Fed faiz kararı'.")
+def web_search(query):
+    # Tavily REST API'sine ham HTTP çağrısı (SDK yok). Anahtar env'den okunur.
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key:
+        return "TAVILY_API_KEY ayarlı değil (ortam değişkeni olarak ver)."
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": api_key,
+                "query": query.strip(),
+                "max_results": 5,
+                "search_depth": "basic",
+                "include_answer": True,   # Tavily'nin ürettiği kısa özet
+            },
+            timeout=25,
+        )
+    except requests.RequestException as e:
+        return f"Ağ hatası: {e}"
+
+    if resp.status_code != 200:
+        return f"Tavily hatası {resp.status_code}: {resp.text[:300]}"
+
+    data = resp.json()
+    lines = []
+    if data.get("answer"):
+        lines.append(f"Özet: {data['answer']}")
+    for i, r in enumerate(data.get("results", []), 1):
+        snippet = (r.get("content") or "")[:200].replace("\n", " ")
+        lines.append(f"{i}. {r.get('title', '(başlık yok)')} — {snippet}\n   {r.get('url', '')}")
+    return "\n".join(lines) if lines else "Sonuç bulunamadı."
+
+
+# --- Borsa araçları (yfinance) ----------------------------------------------
+# yfinance'i fonksiyon içinde import ediyoruz: kütüphane kurulu değilse çekirdek
+# agent yine çalışır, sadece bu araçlar hata mesajı döner.
+
+def _yf():
+    try:
+        import yfinance as yf
+        return yf
+    except ImportError:
+        return None
+
+
+def finance_tool(name, description):
+    """yfinance aracı dekoratörü: yf'yi enjekte eder, kütüphane yoksa /
+    beklenmeyen hatada temiz bir mesaj döndürür. Böylece her araçta aynı
+    try/except iskeletini tekrar yazmayız."""
+    def deco(func):
+        def wrapped(arg):
+            yf = _yf()
+            if yf is None:
+                return "yfinance kurulu değil (uv add yfinance)."
+            try:
+                return func(yf, arg)
+            except Exception as e:
+                return f"{name} hatası: {e}"
+        TOOLS[name] = {"func": wrapped, "description": description}
+        return wrapped
+    return deco
+
+
+def _num(x, nd=2):
+    """Sayıyı güvenle biçimlendir; None/eksikse '?' döndür."""
+    if isinstance(x, (int, float)):
+        return f"{x:,.{nd}f}" if abs(x) < 1e12 else f"{x:,.0f}"
+    return "?"
+
+
+def _sym(arg):
+    """Girdinin ilk kelimesini sembol olarak al (büyük harf)."""
+    parts = arg.strip().split()
+    return parts[0].upper() if parts else ""
+
+
+@finance_tool("get_current_stock_price", "Bir şirketin güncel hisse fiyatını döner. Girdi: sembol, ör. 'AAPL' veya 'THYAO.IS'.")
+def get_current_stock_price(yf, symbol):
+    sym = _sym(symbol)
+    fi = yf.Ticker(sym).fast_info
+    price = fi.get("lastPrice") if hasattr(fi, "get") else getattr(fi, "last_price", None)
+    if price is None:
+        return f"'{sym}' için fiyat bulunamadı (sembol yanlış olabilir)."
+    cur = (fi.get("currency") if hasattr(fi, "get") else getattr(fi, "currency", "")) or ""
+    return f"{sym}: {price:.2f} {cur}".strip()
+
+
+@finance_tool("get_company_info", "Bir şirket hakkında ayrıntılı bilgi (isim, sektör, ülke, çalışan sayısı, özet). Girdi: sembol, ör. 'MSFT'.")
+def get_company_info(yf, symbol):
+    sym = _sym(symbol)
+    info = yf.Ticker(sym).info
+    name = info.get("longName") or info.get("shortName")
+    if not name:
+        return f"'{sym}' için bilgi bulunamadı."
+    summary = (info.get("longBusinessSummary") or "")[:400]
+    lines = [
+        f"İsim: {name} ({sym})",
+        f"Sektör/Endüstri: {info.get('sector', '?')} / {info.get('industry', '?')}",
+        f"Ülke: {info.get('country', '?')}, Çalışan: {info.get('fullTimeEmployees', '?')}",
+        f"Piyasa değeri: {_num(info.get('marketCap'))} {info.get('currency', '')}",
+        f"Web: {info.get('website', '?')}",
+    ]
+    if summary:
+        lines.append(f"Özet: {summary}...")
     return "\n".join(lines)
 
 
-# --- İnternet araması (Tavily) ---------------------------------------------
-# Benchmark tekrar üretilebilir olsun diye sonuçlar diske cache'lenir
-# (WEB_CACHE=0 ile kapatılabilir). Cache dizini ReAct projesinden kopyalandığı
-# için aynı sorgu iki mimaride de aynı çıktıyı verir.
+@finance_tool("get_historical_stock_prices", "Geçmiş hisse fiyatlarını döner. Girdi: 'SEMBOL [DÖNEM] [ARALIK]', ör. 'AAPL 1mo 1d' (dönem: 5d,1mo,6mo,1y; aralık: 1d,1wk,1mo).")
+def get_historical_stock_prices(yf, query):
+    parts = query.strip().split()
+    sym = parts[0].upper() if parts else ""
+    period = parts[1] if len(parts) > 1 else "1mo"
+    interval = parts[2] if len(parts) > 2 else "1d"
+    hist = yf.Ticker(sym).history(period=period, interval=interval)
+    if hist.empty:
+        return f"'{sym}' için '{period}/{interval}' veri yok."
+    tail = hist.tail(10)[["Open", "High", "Low", "Close", "Volume"]].round(2)
+    tail.index = tail.index.strftime("%Y-%m-%d")
+    return f"{sym} ({period}, {interval}) — son {len(tail)} kayıt:\n{tail.to_string()}"
 
-_WEB_CACHE_DIR = Path(__file__).resolve().parents[2] / "scratch" / "web_cache"
+
+@finance_tool("get_stock_fundamentals", "Bir hissenin temel verileri: piyasa değeri, F/K, PD/DD, EPS, temettü, beta, 52h yüksek/düşük. Girdi: sembol.")
+def get_stock_fundamentals(yf, symbol):
+    sym = _sym(symbol)
+    info = yf.Ticker(sym).info
+    if not (info.get("longName") or info.get("shortName")):
+        return f"'{sym}' için veri bulunamadı."
+    dy = info.get("dividendYield")
+    # Not: bu yfinance sürümünde dividendYield zaten yüzde olarak gelir (0.34 = %0.34).
+    return "\n".join([
+        f"{sym} temel veriler:",
+        f"Piyasa değeri: {_num(info.get('marketCap'))} {info.get('currency', '')}",
+        f"F/K (trailing/forward): {_num(info.get('trailingPE'))} / {_num(info.get('forwardPE'))}",
+        f"PD/DD: {_num(info.get('priceToBook'))}, EPS: {_num(info.get('trailingEps'))}",
+        f"Temettü verimi: {f'{dy:.2f}%' if isinstance(dy, (int, float)) else '?'}",
+        f"Beta: {_num(info.get('beta'))}",
+        f"52h yüksek/düşük: {_num(info.get('fiftyTwoWeekHigh'))} / {_num(info.get('fiftyTwoWeekLow'))}",
+    ])
 
 
-def _web_cache_path(query: str) -> Path:
-    digest = hashlib.sha256(query.strip().lower().encode("utf-8")).hexdigest()[:16]
-    return _WEB_CACHE_DIR / f"{digest}.txt"
+@finance_tool("get_income_statements", "Bir şirketin yıllık gelir tablosu (hasılat, brüt kâr, faaliyet kârı, net kâr). Girdi: sembol.")
+def get_income_statements(yf, symbol):
+    sym = _sym(symbol)
+    stmt = yf.Ticker(sym).income_stmt
+    if stmt is None or stmt.empty:
+        return f"'{sym}' için gelir tablosu yok."
+    rows = ["Total Revenue", "Gross Profit", "Operating Income", "Net Income"]
+    out = [f"{sym} gelir tablosu (yıllık, para birimi ham):"]
+    for col in stmt.columns[:4]:  # en yeni 4 yıl
+        year = col.strftime("%Y") if hasattr(col, "strftime") else str(col)
+        parts = []
+        for r in rows:
+            if r in stmt.index:
+                parts.append(f"{r}={_num(stmt.loc[r, col], 0)}")
+        out.append(f"{year}: " + ", ".join(parts))
+    return "\n".join(out)
 
 
-def _web_arama(query: str) -> str:
-    query = query.strip()
-    if not query:
-        return "HATA: boş arama sorgusu."
+@finance_tool("get_key_financial_ratios", "Bir şirketin temel finansal oranları: kâr marjları, ROE/ROA, borç/özkaynak, cari oran. Girdi: sembol.")
+def get_key_financial_ratios(yf, symbol):
+    sym = _sym(symbol)
+    info = yf.Ticker(sym).info
+    if not (info.get("longName") or info.get("shortName")):
+        return f"'{sym}' için oran verisi yok."
+    def pct(k):
+        v = info.get(k)
+        return f"{v * 100:.2f}%" if isinstance(v, (int, float)) else "?"
+    return "\n".join([
+        f"{sym} finansal oranlar:",
+        f"Brüt marj: {pct('grossMargins')}, Faaliyet marjı: {pct('operatingMargins')}, Net marj: {pct('profitMargins')}",
+        f"ROE: {pct('returnOnEquity')}, ROA: {pct('returnOnAssets')}",
+        f"Borç/Özkaynak: {_num(info.get('debtToEquity'))}, Cari oran: {_num(info.get('currentRatio'))}, Nakit oranı: {_num(info.get('quickRatio'))}",
+        f"PD/DD: {_num(info.get('priceToBook'))}, PEG: {_num(info.get('pegRatio'))}",
+    ])
 
-    use_cache = os.getenv("WEB_CACHE", "1") != "0"
-    cache_path = _web_cache_path(query)
-    if use_cache and cache_path.exists():
-        return cache_path.read_text(encoding="utf-8")
 
-    api_key = os.getenv("TAVILY_API_KEY")
-    if not api_key:
-        return "HATA: TAVILY_API_KEY tanımlı değil; internet araması yapılamıyor."
-
+@finance_tool("get_analyst_recommendations", "Bir hisse için analist tavsiyeleri ve hedef fiyatlar. Girdi: sembol.")
+def get_analyst_recommendations(yf, symbol):
+    sym = _sym(symbol)
+    info = yf.Ticker(sym).info
+    key = info.get("recommendationKey", "?")
+    n = info.get("numberOfAnalystOpinions", "?")
+    lines = [
+        f"{sym} analist görüşü: {key} ({n} analist)",
+        f"Hedef fiyat — ort: {_num(info.get('targetMeanPrice'))}, "
+        f"yüksek: {_num(info.get('targetHighPrice'))}, düşük: {_num(info.get('targetLowPrice'))}",
+    ]
     try:
-        from tavily import TavilyClient
-    except ImportError:
-        return "HATA: 'tavily' paketi kurulu değil (uv add tavily-python)."
-
-    client = TavilyClient(api_key=api_key)
-    response = client.search(query, max_results=5, topic="general", include_answer=True)
-
-    parts: list[str] = []
-    answer = response.get("answer")
-    if answer:
-        parts.append(f"Özet: {answer}")
-    for item in response.get("results", []):
-        title = (item.get("title") or "").strip()
-        content = (item.get("content") or "").strip()
-        url = item.get("url") or ""
-        parts.append(f"- {title}: {content} ({url})")
-
-    text = "\n".join(parts) if parts else "Arama sonucu bulunamadı."
-
-    if use_cache:
-        _WEB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(text, encoding="utf-8")
-    return text
+        rec = yf.Ticker(sym).recommendations
+        if rec is not None and not rec.empty:
+            row = rec.iloc[0]
+            lines.append(
+                f"Dağılım: strongBuy={row.get('strongBuy', '?')}, buy={row.get('buy', '?')}, "
+                f"hold={row.get('hold', '?')}, sell={row.get('sell', '?')}, strongSell={row.get('strongSell', '?')}"
+            )
+    except Exception:
+        pass
+    return "\n".join(lines)
 
 
-# --- LangChain araç sarmalları ---------------------------------------------
-# İç mantık yukarıda; burada create_react_agent'ın kullanacağı @tool nesneleri.
+@finance_tool("get_company_news", "Bir şirketle ilgili son haberleri döner. Girdi: sembol.")
+def get_company_news(yf, symbol):
+    sym = _sym(symbol)
+    news = yf.Ticker(sym).news or []
+    if not news:
+        return f"'{sym}' için haber bulunamadı."
+    out = [f"{sym} son haberler:"]
+    for item in news[:5]:
+        # yfinance iki farklı biçim kullanabiliyor: düz ya da 'content' altında.
+        content = item.get("content", item)
+        title = content.get("title") or item.get("title") or "(başlık yok)"
+        pub = (content.get("provider", {}) or {}).get("displayName") or item.get("publisher") or ""
+        out.append(f"- {title}" + (f" [{pub}]" if pub else ""))
+    return "\n".join(out)
 
 
-@tool
-def calculator(expression: str) -> str:
-    """Aritmetik ifadeleri hesaplar. Girdi olarak bir matematik ifadesi al.
-    Desteklenen: + - * / // % **, sqrt, log, sin, cos, tan, abs, round,
-    min, max. Örnek girdi: min(1900, 300 + 95*12)"""
+@finance_tool("get_technical_indicators", "Hisse için teknik göstergeler (SMA20/50, EMA20, RSI14, MACD, Bollinger) hesaplar. Girdi: 'SEMBOL [DÖNEM]', ör. 'AAPL 6mo'.")
+def get_technical_indicators(yf, query):
+    parts = query.strip().split()
+    sym = parts[0].upper() if parts else ""
+    period = parts[1] if len(parts) > 1 else "6mo"
+    hist = yf.Ticker(sym).history(period=period)
+    if hist.empty or len(hist) < 15:
+        return f"'{sym}' için yeterli veri yok ({period})."
+    close = hist["Close"]
+    last = close.iloc[-1]
+    sma20 = close.rolling(20).mean().iloc[-1]
+    sma50 = close.rolling(50).mean().iloc[-1]
+    ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+    # RSI(14)
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss
+    rsi = (100 - 100 / (1 + rs)).iloc[-1]
+    # MACD(12,26,9): hızlı-yavaş EMA farkı + sinyal çizgisi
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    macd, signal = macd_line.iloc[-1], signal_line.iloc[-1]
+    macd_hist = macd - signal
+    macd_yon = "al sinyali (MACD>Sinyal)" if macd > signal else "sat sinyali (MACD<Sinyal)"
+    # Bollinger Bantları (20, 2σ)
+    mid = close.rolling(20).mean()
+    std = close.rolling(20).std()
+    upper = (mid + 2 * std).iloc[-1]
+    lower = (mid - 2 * std).iloc[-1]
+    trend = "yukarı" if last > sma50 else "aşağı"
+    return "\n".join([
+        f"{sym} teknik göstergeler ({period}):",
+        f"Son kapanış: {last:.2f}",
+        f"SMA20: {_num(sma20)}, SMA50: {_num(sma50)}, EMA20: {_num(ema20)}",
+        f"RSI(14): {_num(rsi)} ({'aşırı alım' if rsi > 70 else 'aşırı satım' if rsi < 30 else 'nötr'})",
+        f"MACD: {_num(macd)}, Sinyal: {_num(signal)}, Histogram: {_num(macd_hist)} → {macd_yon}",
+        f"Bollinger: alt {_num(lower)} / orta {_num(mid.iloc[-1])} / üst {_num(upper)}",
+        f"Fiyat SMA50'nin {trend}sında (trend: {trend})",
+    ])
+
+
+@finance_tool("get_quarterly_income_statements", "Çeyreklik gelir tablosu (hasılat, brüt/faaliyet/net kâr). Girdi: sembol.")
+def get_quarterly_income_statements(yf, symbol):
+    sym = _sym(symbol)
+    stmt = yf.Ticker(sym).quarterly_income_stmt
+    if stmt is None or stmt.empty:
+        return f"'{sym}' için çeyreklik gelir tablosu yok."
+    rows = ["Total Revenue", "Gross Profit", "Operating Income", "Net Income"]
+    out = [f"{sym} çeyreklik gelir tablosu:"]
+    for col in stmt.columns[:4]:   # son 4 çeyrek
+        q = col.strftime("%Y-%m-%d") if hasattr(col, "strftime") else str(col)
+        parts = [f"{r}={_num(stmt.loc[r, col], 0)}" for r in rows if r in stmt.index]
+        out.append(f"{q}: " + ", ".join(parts))
+    return "\n".join(out)
+
+
+@finance_tool("get_balance_sheet", "Yıllık bilanço özeti (varlık, borç, özkaynak, nakit). Girdi: sembol.")
+def get_balance_sheet(yf, symbol):
+    sym = _sym(symbol)
+    bs = yf.Ticker(sym).balance_sheet
+    if bs is None or bs.empty:
+        return f"'{sym}' için bilanço verisi yok."
+    rows = ["Total Assets", "Total Liabilities Net Minority Interest",
+            "Stockholders Equity", "Total Debt", "Cash And Cash Equivalents"]
+    out = [f"{sym} bilanço (yıllık):"]
+    for col in bs.columns[:3]:
+        y = col.strftime("%Y") if hasattr(col, "strftime") else str(col)
+        parts = [f"{r}={_num(bs.loc[r, col], 0)}" for r in rows if r in bs.index]
+        out.append(f"{y}: " + ", ".join(parts))
+    return "\n".join(out)
+
+
+@finance_tool("get_cash_flow", "Yıllık nakit akışı (faaliyet, yatırım, finansman, serbest nakit). Girdi: sembol.")
+def get_cash_flow(yf, symbol):
+    sym = _sym(symbol)
+    cf = yf.Ticker(sym).cashflow
+    if cf is None or cf.empty:
+        return f"'{sym}' için nakit akışı verisi yok."
+    rows = ["Operating Cash Flow", "Investing Cash Flow",
+            "Financing Cash Flow", "Free Cash Flow"]
+    out = [f"{sym} nakit akışı (yıllık):"]
+    for col in cf.columns[:3]:
+        y = col.strftime("%Y") if hasattr(col, "strftime") else str(col)
+        parts = [f"{r}={_num(cf.loc[r, col], 0)}" for r in rows if r in cf.index]
+        out.append(f"{y}: " + ", ".join(parts))
+    return "\n".join(out)
+
+
+@finance_tool("compare_stocks", "İki hisseyi yan yana karşılaştırır (fiyat, F/K, PD/DD, ROE, piyasa değeri). Girdi: 'SEMBOL1 SEMBOL2', ör. 'AAPL MSFT'.")
+def compare_stocks(yf, query):
+    parts = query.replace(",", " ").split()
+    if len(parts) < 2:
+        return "İki sembol gir: örn. 'AAPL MSFT'."
+    a, b = parts[0].upper(), parts[1].upper()
+
+    def snap(sym):
+        info = yf.Ticker(sym).info
+        roe = info.get("returnOnEquity")
+        return {
+            "Fiyat": _num(info.get("currentPrice") or info.get("regularMarketPrice")),
+            "F/K": _num(info.get("trailingPE")),
+            "PD/DD": _num(info.get("priceToBook")),
+            "ROE": f"{roe * 100:.2f}%" if isinstance(roe, (int, float)) else "?",
+            "Piyasa Değeri": _num(info.get("marketCap")),
+        }
+
+    ra, rb = snap(a), snap(b)
+    out = [f"Karşılaştırma: {a} vs {b}"]
+    for k in ra:
+        out.append(f"{k}: {a}={ra[k]}  |  {b}={rb[k]}")
+    return "\n".join(out)
+
+
+def _ascii_fold(text):
+    """Türkçe karakterleri ASCII'ye indir (Yahoo araması 'Şişecam'ı bulamıyor,
+    'Sisecam'ı bulabiliyor)."""
+    table = str.maketrans("şŞıİğĞüÜöÖçÇ", "sSiIgGuUoOcC")
+    return text.translate(table)
+
+
+def _yf_search(yf, q):
+    """yfinance sürümüne göre Search/Lookup ile sembol arar; quote listesi döner."""
+    if hasattr(yf, "Search"):
+        res = yf.Search(q, max_results=5)
+        return getattr(res, "quotes", None) or (res.get("quotes") if isinstance(res, dict) else [])
+    if hasattr(yf, "Lookup"):
+        return yf.Lookup(q).all.head(5).reset_index().to_dict("records")
+    return []
+
+
+@finance_tool("resolve_ticker", "Şirket adından borsa sembolünü bulur. Girdi: şirket adı, ör. 'Şişecam' veya 'Coca Cola'.")
+def resolve_ticker(yf, name):
+    q = name.strip()
     try:
-        return _calculator(expression)
-    except Exception as exc:  # noqa: BLE001 - araç hatası ajana geri döner
-        return f"HATA: {exc}"
+        quotes = _yf_search(yf, q)
+        # Türkçe adlar Yahoo'da tutmayabilir; ASCII'ye indirip bir daha dene.
+        if not quotes and _ascii_fold(q) != q:
+            quotes = _yf_search(yf, _ascii_fold(q))
+    except Exception as e:
+        return f"Sembol araması başarısız ({e}). web_search ile deneyebilirsin."
+    lines = []
+    for it in list(quotes)[:5]:
+        sym = it.get("symbol") or it.get("Symbol") or it.get("index")
+        nm = it.get("shortname") or it.get("longname") or it.get("shortName") or it.get("name") or ""
+        exch = it.get("exchange") or it.get("exchDisp") or ""
+        if sym:
+            lines.append(f"{sym} — {nm} ({exch})".strip())
+    if lines:
+        return f"'{q}' için bulunan semboller:\n" + "\n".join(lines)
+    return f"'{q}' için sembol bulunamadı. web_search ile aramayı deneyebilirsin."
 
 
-@tool
-def kkb_bilgi(query: str) -> str:
-    """Ardıldeks skorunun hesaplama formülünü verir. Bir kişinin Ardıldeks
-    skorunu hesaplarken bu formülü öğrenmek için kullan. KKB firması
-    hakkındaki güncel/olgusal sorular için bunu DEĞİL web_arama'yı kullan.
-    Girdi: 'ardildeks formülü'"""
+# Grafikler buraya kaydedilir (proje kökü / scratch / charts).
+CHARTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scratch", "charts"
+)
+
+
+@finance_tool("plot_chart", "Bir hisse için grafik çizip PNG kaydeder ve yolunu döner. Girdi: 'SEMBOL [DÖNEM] [TÜR]', TÜR: price|revenue (ör. 'AAPL 6mo price').")
+def plot_chart(yf, query):
+    import uuid
+    import matplotlib
+    matplotlib.use("Agg")           # başsız (GUI'siz) çizim
+    import matplotlib.pyplot as plt
+
+    # TÜR'ü (price/revenue) konumdan bağımsız yakala: model 'KO revenue' de
+    # yazabilir 'KO 6mo price' de. price/revenue dışındaki token = dönem.
+    tokens = query.strip().split()
+    sym = tokens[0].upper() if tokens else ""
+    kind, period = "price", "6mo"
+    for tok in tokens[1:]:
+        if tok.lower() in ("price", "revenue"):
+            kind = tok.lower()
+        else:
+            period = tok
+
+    t = yf.Ticker(sym)
+    os.makedirs(CHARTS_DIR, exist_ok=True)
+    path = os.path.join(CHARTS_DIR, f"{sym}_{kind}_{period}_{uuid.uuid4().hex[:6]}.png")
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
     try:
-        return _kkb_bilgi(query)
-    except Exception as exc:  # noqa: BLE001
-        return f"HATA: {exc}"
+        if kind == "revenue":
+            stmt = t.income_stmt
+            if stmt is None or stmt.empty or "Total Revenue" not in stmt.index:
+                return f"'{sym}' için gelir verisi yok."
+            rev = stmt.loc["Total Revenue"].dropna()[::-1]
+            years = [c.strftime("%Y") if hasattr(c, "strftime") else str(c) for c in rev.index]
+            ax.bar(years, rev.values / 1e9)
+            ax.set_ylabel("Hasılat (milyar)")
+            ax.set_title(f"{sym} Yıllık Hasılat")
+        else:
+            hist = t.history(period=period)
+            if hist.empty:
+                return f"'{sym}' için fiyat verisi yok ({period})."
+            ax.plot(hist.index, hist["Close"])
+            ax.set_ylabel("Kapanış")
+            ax.set_title(f"{sym} Fiyat ({period})")
+            ax.grid(True, alpha=0.3)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        fig.savefig(path, dpi=100)
+    finally:
+        plt.close(fig)
+    return f"Grafik kaydedildi: {path}"
 
 
-@tool
-def sql_sorgu(query: str) -> str:
-    """Persona kredi veritabanında salt-okunur SELECT çalıştırır.
-    Tablo: personalar(id, ad, odeme_gecmisi, borc_kullanim_orani,
-    karsiliksiz_cek, aktif_kredi_sayisi, en_eski_hesap_yili, toplam_borc,
-    gecikmis_borc). Kişiye ait ham verileri çekmek için kullan.
-    Örnek girdi: SELECT * FROM personalar WHERE ad LIKE '%Ardıl%'"""
-    try:
-        return _sql_sorgu(query)
-    except Exception as exc:  # noqa: BLE001
-        return f"HATA: {exc}"
+def render_tool_descriptions():
+    """Sistem prompt'una gömmek için araç listesini metne çevirir."""
+    return "\n".join(f"- {name}: {info['description']}" for name, info in TOOLS.items())
 
 
-@tool
-def web_arama(query: str) -> str:
-    """Bilgi tabanında olmayan güncel/gerçek dünya bilgisi için internette
-    arama yapar. Girdi olarak arama sorgusu al. Örnek girdi: KKB 2025 cirosu"""
-    try:
-        return _web_arama(query)
-    except Exception as exc:  # noqa: BLE001
-        return f"HATA: {exc}"
+def run_tool(name, tool_input):
+    """Adı verilen aracı çalıştırır; yoksa hata mesajı döner."""
+    name = name.strip()
+    if name not in TOOLS:
+        return f"HATA: '{name}' diye bir araç yok. Mevcut araçlar: {list(TOOLS)}"
+    return TOOLS[name]["func"](tool_input)
 
 
-def get_tools() -> list:
-    """Ortak araç listesi — hem Plan-Execute hem ReAct AYNI seti kullanır.
+# --- LangGraph köprüsü ------------------------------------------------------
+# Plan-Execute'un executor'ı bir LangGraph ``create_react_agent`` alt-ajanıdır ve
+# LangChain araç NESNELERİ ister. Yukarıdaki TOOLS registry'si (react_scratch ile
+# BİREBİR aynı: aynı adlar, aynı davranış, aynı çıktılar) tek kaynak olarak kalır;
+# burada her kaydı tek-string girdili bir StructuredTool'a sarıyoruz. Böylece iki
+# proje AYNI araçları kullanır, tek değişken mimari olur.
 
-    KKB benchmark araç seti: calculator, kkb_bilgi, sql_sorgu, web_arama.
+
+def get_tools(names=None):
+    """Registry'deki araçları LangChain ``StructuredTool`` listesine çevirir.
+
+    names verilirse yalnızca o araçlar döndürülür (varsayılan: tümü).
     """
-    return [calculator, kkb_bilgi, sql_sorgu, web_arama]
+    from langchain_core.tools import StructuredTool
+
+    selected = list(TOOLS) if names is None else [n for n in names if n in TOOLS]
+    lc_tools = []
+    for name in selected:
+        info = TOOLS[name]
+
+        def _make(fn):
+            # tek argüman: modelin dolduracağı serbest metin girdisi.
+            def _call(tool_input: str) -> str:
+                return fn(tool_input)
+            return _call
+
+        lc_tools.append(
+            StructuredTool.from_function(
+                func=_make(info["func"]),
+                name=name,
+                description=info["description"],
+            )
+        )
+    return lc_tools

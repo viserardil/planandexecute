@@ -1,12 +1,3 @@
-"""Plan-Execute grafiğini komut satırından (canlı stream) çalıştırma girişi.
-
-Bu, grafiğin adım adım nasıl ilerlediğini görmek içindir (planner → executor →
-replanner). Metrik toplamak için ``main.py`` veya ``test/test_plan_execute_agent.py``
-kullan.
-
-Kullanım:
-    uv run python -m plan_execute.run "Görev metni burada"
-"""
 
 from __future__ import annotations
 
@@ -14,7 +5,7 @@ import sys
 
 from plan_execute.graph import build_plan_execute_graph
 
-DEFAULT_TASK = "Can Öztürk'ün Ardıldeks skoru kaçtır?"
+DEFAULT_TASK = "What is the current share price of Apple?"
 
 
 def main(task: str) -> None:

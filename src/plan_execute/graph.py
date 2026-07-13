@@ -25,7 +25,13 @@ def build_plan_execute_graph():
     workflow.add_node("replanner", replan_step)
 
     workflow.add_edge(START, "planner")
-    workflow.add_edge("planner", "executor")
+    # Planner doğrudan cevap ürettiyse (araç gerektirmeyen soru) executor'a hiç
+    # gitmeden biter; aksi halde planı yürütmek için executor'a geçer.
+    workflow.add_conditional_edges(
+        "planner",
+        should_end,
+        {"executor": "executor", "__end__": END},
+    )
     workflow.add_edge("executor", "replanner")
     workflow.add_conditional_edges(
         "replanner",

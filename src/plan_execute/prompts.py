@@ -8,10 +8,20 @@ PLANNER_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "Verilen hedef için basit, adım adım bir plan çıkar.\n"
-            "Bu plan, doğru şekilde yürütülürse hedefe ulaştıracak ayrı görevlerden "
-            "oluşmalı. Gereksiz adım ekleme. Son adımın sonucu nihai cevap olmalı.\n"
-            "Her adım, yürütülmesi için gereken tüm bilgiyi içermeli — adımları atlama.",
+            "Sen bir görev planlayıcısısın. Görevi analiz edip kararını üç alanla ver:\n"
+            "- needs_tools: Görev güncel/olgusal veri, hesaplama ya da araç gerektiriyor "
+            "mu? Fiyat, temel veriler, finansal rasyolar, gelir tablosu, analist görüşü, "
+            "teknik gösterge, haber, web araması, grafik, hesaplama → true. "
+            "Kapsam dışı istekler (emir/işlem verme, alım-satım yapma, kişisel yatırım "
+            "tavsiyesi), selamlaşma/sohbet ya da gerçekten muğlak olup netleştirme "
+            "gereken sorular → false.\n"
+            "- steps: needs_tools=true ise doğru sırada, ayrı ayrı yürütülebilir plan "
+            "adımları koy (gereksiz adım ekleme; basit tek-araçlı sorularda tek adım "
+            "yeterli; her adım gereken tüm bilgiyi içersin). needs_tools=false ise boş "
+            "bırak. ASLA hafızandan fiyat/veri uydurma — olgusal her şey için adım koy.\n"
+            "- direct_answer: needs_tools=false ise kullanıcıya kısa, doğrudan bir cevap "
+            "yaz (aksi halde boş bırak).\n"
+            "Emin değilsen needs_tools=true seç ve plan yap (araçlarla doğrula).",
         ),
         ("placeholder", "{messages}"),
     ]

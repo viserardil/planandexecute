@@ -4,7 +4,7 @@ ReAct projesindeki main.py ile simetrik: aynı örnek görevler, aynı metrik ö
 
 Kullanım:
     uv run python main.py                         # örnek görevleri çalıştır
-    uv run python main.py "Can Öztürk'ün Ardıldeks skoru kaçtır?"  # tek soru
+    uv run python main.py "What is the current share price of Apple?"  # tek soru
 """
 
 from __future__ import annotations
@@ -21,12 +21,14 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from plan_execute.agent import PlanExecuteAgent, RunResult  # noqa: E402
+from plan_execute.config import settings  # noqa: E402
 
-# Örnek görev seti — ReAct main.py ile aynı görevler (adil karşılaştırma).
+# Örnek görev seti — equity-research dataset'inden birkaç soru (farklı araçları
+# tetikler: fiyat / temel analiz / haber). Tam eval için test/test.py kullan.
 SAMPLE_TASKS = [
-    "KKB'nin toplam kaç ürünü vardır ve isimleri nelerdir?",
-    "Ardıl'ın Ardıldeks skoru kaçtır?",
-    "KKB'nin Anadolu Veri Merkezi hangi yılda %100 kapasiteye ulaşmıştır?",
+    "What is the current share price of Apple?",
+    "BIMAS.IS için temel analiz verilerini ve mevcut çarpanlarını görebilir miyim?",
+    "What are the latest news headlines for JPM?",
 ]
 
 
@@ -46,10 +48,11 @@ def _print_metrics(r: RunResult) -> None:
 
 def main() -> None:
     load_dotenv()
-    if not (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")):
+    # Sağlayıcı-bağımsız: herhangi bir LLM anahtarı yeter (LLM_API_KEY / HF_TOKEN / ...).
+    if not settings.api_key:
         sys.exit(
-            "HF_TOKEN tanımlı değil. .env dosyasına HuggingFace API anahtarını "
-            "HF_TOKEN=<anahtar> olarak ekle."
+            "LLM API anahtarı bulunamadı. .env dosyasına LLM_API_KEY=<anahtar> ekle "
+            "(HuggingFace kullanıyorsan HF_TOKEN da olur)."
         )
 
     recursion_limit = int(os.getenv("RECURSION_LIMIT", "50"))

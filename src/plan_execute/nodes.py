@@ -1,24 +1,4 @@
-"""Plan-Execute grafiğinin düğümleri: plan → execute → replan.
 
-Mimari (Plan-and-Execute, Wang et al. 2023 / LangGraph):
-
-    ┌─────────┐      ┌──────────┐      ┌───────────┐
-    │ planner │ ───▶ │ executor │ ───▶ │ replanner │
-    └─────────┘      └──────────┘      └─────┬─────┘
-                          ▲                  │
-                          └──────────────────┘  (plan bitmediyse)
-                                             │
-                                             ▼
-                                          (bitti → END)
-
-- planner:  Görev için baştan tüm planı çıkarır (bir kez).
-- executor: Plandaki İLK adımı bir ReAct alt-ajanı ile yürütür.
-- replanner: Kalan plana ve sonuçlara bakıp ya günceller ya da nihai cevabı verir.
-
-Bu, ReAct'ten temel farktır: ReAct her adımda "düşün-eyle" döngüsü kurarken,
-Plan-Execute önce planı çıkarır, sonra yürütür; bu genelde daha az LLM çağrısıyla
-uzun görevlerde daha tutarlı olur — ölçeceğimiz şey tam olarak bu.
-"""
 
 from __future__ import annotations
 
@@ -26,9 +6,9 @@ from functools import lru_cache
 
 from langgraph.prebuilt import create_react_agent
 
-from plan_execute.config import get_llm
+from plan_execute.config import get_llm, structured_output_kwargs
 from plan_execute.prompts import PLANNER_PROMPT, REPLANNER_PROMPT
-from plan_execute.schemas import Act, Plan, Response
+from plan_execute.schemas import Act, PlannerDecision, Response
 from plan_execute.state import PlanExecute
 from plan_execute.tools import get_tools
 
@@ -43,22 +23,36 @@ def _get_executor_agent():
     return create_react_agent(get_llm(), get_tools())
 
 
+# Structured output VARSAYILAN (json_schema) yöntemle yapılır. Neden:
+#   - Sağlayıcı :deepinfra'ya sabitlendiği için json_schema destekleniyor (novita
+#     desteklemiyordu → 400; bkz config.DEFAULT_MODEL).
+#   - Replanner'ın Act şeması Union[Response, Plan] içerir; json_schema bu union'ı
+#     üretim anında ZORLAR ve güvenilir parse eder. function_calling ise union'da
+#     bazen 'action'a düz string koyup pydantic ValidationError'a yol açar (0/3).
 @lru_cache(maxsize=1)
 def _get_planner():
-    """Structured output ile plan üreten planner zinciri."""
-    return PLANNER_PROMPT | get_llm().with_structured_output(Plan)
+    """Planner zinciri. PlannerDecision döndürür: araç gerektiren görevlerde plan
+    adımları (steps), gerektirmeyenlerde (kapsam dışı/selamlama/netleştirme)
+    doğrudan cevap (direct_answer) → basit sorularda plan-execute döngüsü çalışmaz."""
+    return PLANNER_PROMPT | get_llm().with_structured_output(PlannerDecision, **structured_output_kwargs())
 
 
 @lru_cache(maxsize=1)
 def _get_replanner():
     """Devam mı bitiş mi kararını veren replanner zinciri."""
-    return REPLANNER_PROMPT | get_llm().with_structured_output(Act)
+    return REPLANNER_PROMPT | get_llm().with_structured_output(Act, **structured_output_kwargs())
 
 
 def plan_step(state: PlanExecute) -> dict:
-    """Görev için ilk planı üretir."""
-    plan = _get_planner().invoke({"messages": [("user", state["input"])]})
-    return {"plan": plan.steps}
+    """İlk kararı verir: araç gerekiyorsa PLAN üretir; gerekmiyorsa doğrudan
+    CEVABI döndürür. İkinci durumda koşullu kenar (should_end) cevabı görüp
+    END'e gider — executor/replanner hiç çalışmaz, plan-execute döngüsü dönmez."""
+    decision = _get_planner().invoke({"messages": [("user", state["input"])]})
+    # Araç gerekmez + doğrudan cevap varsa: hemen bitir.
+    if not decision.needs_tools and decision.direct_answer.strip():
+        return {"response": decision.direct_answer}
+    # Araç gerekli: plan üret. Emniyet: adım boş dönerse görevi tek adım yap.
+    return {"plan": decision.steps or [state["input"]]}
 
 
 def execute_step(state: PlanExecute) -> dict:
@@ -78,11 +72,15 @@ def execute_step(state: PlanExecute) -> dict:
 
 
 def replan_step(state: PlanExecute) -> dict:
-    """Sonuçlara göre planı günceller veya nihai cevabı üretir."""
+    """Sonuçlara göre planı günceller veya nihai cevabı üretir.
+
+    Nihai cevap (Response) üretmek bir "bitir" kararıdır, plan revizyonu değildir;
+    o yüzden replan_count YALNIZCA yeni bir Plan döndürüldüğünde artırılır.
+    """
     output = _get_replanner().invoke(state)
     if isinstance(output.action, Response):
         return {"response": output.action.response}
-    return {"plan": output.action.steps}
+    return {"plan": output.action.steps, "replan_count": 1}
 
 
 def should_end(state: PlanExecute) -> str:
