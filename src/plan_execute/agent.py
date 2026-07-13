@@ -63,7 +63,7 @@ class MetricsCallback(BaseCallbackHandler):
     tokens) main.py/eski test'in beklediği run-seviyesi özet için tutulur.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, on_event=None) -> None:
         self.llm_calls = 0
         self.input_tokens = 0
         self.output_tokens = 0
@@ -72,6 +72,16 @@ class MetricsCallback(BaseCallbackHandler):
         self.events: list[dict] = []
         self._llm_t0: dict = {}
         self._tool_t0: dict = {}
+        # Opsiyonel canlı kanca: her LLM/araç olayı bittiğinde çağrılır (vaka
+        # içinde ilerleme göstermek için — ör. test live-log). Hata koşuyu düşürmez.
+        self._on_event = on_event
+
+    def _emit(self, event: dict) -> None:
+        if self._on_event:
+            try:
+                self._on_event(event)
+            except Exception:
+                pass
 
     # LLM zamanlaması: sohbet modelleri on_chat_model_start + on_llm_end kullanır.
     def on_chat_model_start(self, serialized, messages, *, run_id=None, **kwargs) -> None:  # noqa: ANN001
@@ -87,7 +97,7 @@ class MetricsCallback(BaseCallbackHandler):
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
         self.llm_calls += 1
-        self.events.append({
+        event = {
             "kind": "llm",
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -95,7 +105,9 @@ class MetricsCallback(BaseCallbackHandler):
             "started_at": started,
             "ended_at": _now_iso(),
             "duration_ms": round(duration_ms, 3),
-        })
+        }
+        self.events.append(event)
+        self._emit(event)
 
     def on_tool_start(self, serialized, input_str, *, run_id=None, inputs=None, **kwargs) -> None:  # noqa: ANN001
         name = (serialized or {}).get("name") or "bilinmeyen_araç"
@@ -114,7 +126,7 @@ class MetricsCallback(BaseCallbackHandler):
         out = str(getattr(output, "content", output))
         self.tool_calls += 1
         self.tools_used.append(name)
-        self.events.append({
+        event = {
             "kind": "tool",
             "name": name,
             "input": str(tool_input),
@@ -123,7 +135,9 @@ class MetricsCallback(BaseCallbackHandler):
             "started_at": started,
             "ended_at": _now_iso(),
             "duration_ms": round(duration_ms, 3),
-        })
+        }
+        self.events.append(event)
+        self._emit(event)
 
     def on_tool_error(self, error, *, run_id=None, **kwargs) -> None:  # noqa: ANN001
         t0, started, name, tool_input = self._tool_t0.pop(
@@ -132,7 +146,7 @@ class MetricsCallback(BaseCallbackHandler):
         duration_ms = (time.perf_counter() - t0) * 1000 if t0 is not None else 0.0
         self.tool_calls += 1
         self.tools_used.append(name)
-        self.events.append({
+        event = {
             "kind": "tool",
             "name": name,
             "input": str(tool_input),
@@ -141,7 +155,9 @@ class MetricsCallback(BaseCallbackHandler):
             "started_at": started,
             "ended_at": _now_iso(),
             "duration_ms": round(duration_ms, 3),
-        })
+        }
+        self.events.append(event)
+        self._emit(event)
 
     @property
     def total_tokens(self) -> int:
@@ -296,8 +312,10 @@ class PlanExecuteAgent:
         lines.append(f"Yeni görev: {question}")
         return "\n".join(lines)
 
-    def run(self, question: str, thread_id: str | None = None) -> RunResult:
-        metrics = MetricsCallback()
+    def run(self, question: str, thread_id: str | None = None, on_event=None) -> RunResult:
+        # on_event(event): her LLM/araç olayı bittiğinde çağrılır — vaka içinde
+        # canlı ilerleme göstermek için (test live-log, UI stream vb.).
+        metrics = MetricsCallback(on_event=on_event)
         config = {"callbacks": [metrics], "recursion_limit": self.recursion_limit}
 
         history = self._memory.get(thread_id, []) if thread_id else []

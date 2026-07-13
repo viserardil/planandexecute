@@ -66,6 +66,12 @@ class Settings:
     )
     temperature: float = field(default_factory=lambda: float(os.getenv("TEMPERATURE", "0.1")))
     max_tokens: int = field(default_factory=lambda: int(os.getenv("MAX_TOKENS", "4096")))
+    # Tek bir LLM çağrısı için istek zaman aşımı (sn) + yeniden deneme. Sağlayıcı
+    # bir bağlantıyı askıya alırsa çağrı SONSUZA KADAR beklemesin diye şart:
+    # timeout dolunca hata verir, birkaç kez dener, olmazsa vaka error olur ve koşu
+    # sıradaki soruya geçer (bloklanmaz).
+    timeout: float = field(default_factory=lambda: float(os.getenv("LLM_TIMEOUT", "90")))
+    max_retries: int = field(default_factory=lambda: int(os.getenv("LLM_MAX_RETRIES", "2")))
     # structured output yöntemi: boş → LangChain varsayılanı (OpenAI/HF'de json_schema).
     structured_method: str | None = field(default_factory=lambda: (os.getenv("LLM_STRUCTURED_METHOD") or "").strip() or None)
 
@@ -97,6 +103,8 @@ def get_llm(**overrides):
         api_key=settings.api_key,
         temperature=settings.temperature,
         max_tokens=settings.max_tokens,
+        timeout=settings.timeout,          # tek çağrı zaman aşımı (askıyı önler)
+        max_retries=settings.max_retries,  # geçici hatada yeniden dene
     )
 
     if settings.provider == "openai":

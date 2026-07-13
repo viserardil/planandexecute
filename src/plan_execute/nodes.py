@@ -58,6 +58,8 @@ def plan_step(state: PlanExecute) -> dict:
 def execute_step(state: PlanExecute) -> dict:
     """Plandaki ilk adımı ReAct alt-ajanıyla yürütür."""
     plan = state["plan"]
+    if not plan:  # emniyet: boş plan gelirse patlama, replanner karar versin
+        return {}
     plan_str = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(plan))
     task = plan[0]
     task_prompt = (
@@ -80,7 +82,13 @@ def replan_step(state: PlanExecute) -> dict:
     output = _get_replanner().invoke(state)
     if isinstance(output.action, Response):
         return {"response": output.action.response}
-    return {"plan": output.action.steps, "replan_count": 1}
+    steps = output.action.steps
+    if not steps:
+        # Boş plan = yapacak yeni adım yok. Sonsuz döngü / execute_step'te plan[0]
+        # IndexError yerine son adımın sonucunu nihai cevap yap.
+        past = state.get("past_steps") or []
+        return {"response": past[-1][1] if past else "Görev tamamlandı."}
+    return {"plan": steps, "replan_count": 1}
 
 
 def should_end(state: PlanExecute) -> str:

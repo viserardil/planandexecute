@@ -229,7 +229,20 @@ class EvalRunner:
 
         t0 = time.time()
         try:
-            rr = agent.run(case.prompt)
+            # Canlı ilerleme: her LLM/araç olayı bittiğinde live-log'a satır düş
+            # (vaka İÇİNDE görünürlük — "donmuş mu" belirsizliğini önler).
+            def _live_event(ev):
+                if ev.get("kind") == "tool":
+                    mark = "✅" if ev.get("success", True) else "❌"
+                    self._live(f"        · {ev.get('name')}({_one_line(str(ev.get('input', '')), 70)}) "
+                               f"{mark} {ev.get('duration_ms', 0):.0f}ms")
+                    if ev.get("output"):
+                        self._live(f"           → {_one_line(str(ev['output']), 200)}")
+                else:  # llm turu
+                    self._live(f"        · … LLM turu ({ev.get('duration_ms', 0) / 1000:.1f}s, "
+                               f"+{ev.get('output_tokens', 0)} tok)")
+
+            rr = agent.run(case.prompt, on_event=_live_event)
             schema = to_run_result_schema(
                 rr, prompt=case.prompt, model=model_name, model_params=model_params,
                 case_id=case.case_id, framework=self.framework,
@@ -254,18 +267,13 @@ class EvalRunner:
                        f"adım={rr.steps} plan={rr.plan_steps} araç={rr.tool_calls} "
                        f"({', '.join(rr.tools_used) or '-'}) token={rr.total_tokens} "
                        f"süre={rr.elapsed_seconds:.1f}sn")
-            # Ayrıntılı döküm — UI ile AYNI format (plan başlığı + her araç çağrısı).
+            # Bitiş özeti: PLAN + CEVAP. (Araç çağrıları yukarıda CANLI aktı, burada
+            # tekrar etmiyoruz.)
             for st in build_detail_trace(rr, obs_limit=220):
                 if st["adim"] == "Plan":
                     self._live("        PLAN:")
                     for line in (st["thought"] or "").splitlines():
                         self._live(f"          {line}")
-                elif st["action"]:
-                    mark = "✅" if st["ok"] else "❌"
-                    ain = _one_line(st.get("action_input") or "", 80)
-                    self._live(f"        {st['adim']}. {st['action']}({ain})  {mark} {st['ms']}ms")
-                    if st.get("observation"):
-                        self._live(f"           → {_one_line(st['observation'], 220)}")
             self._live(f"        CEVAP: {_one_line(rr.answer, 240)}")
         except Exception as exc:  # ajan/ağ hatası: koşuyu düşürme, hatayı kaydet
             err = f"{type(exc).__name__}: {exc}"

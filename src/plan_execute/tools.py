@@ -496,6 +496,81 @@ def plot_chart(yf, query):
     return f"Grafik kaydedildi: {path}"
 
 
+@tool(
+    "visualize_data",
+    "VERİLEN ham veriyle grafik (bar/line/pie) çizip PNG kaydeder ve yolunu döner. "
+    "Hisse fiyatı için değil, elindeki sayısal veriyi görselleştirmek için kullan. "
+    "Girdi: JSON nesnesi. Alanlar: 'x' (etiketler listesi), 'y' (sayı listesi), "
+    "'kind' (bar|line|pie, opsiyonel), 'title' (opsiyonel), 'instruction' (opsiyonel; "
+    "tür buradan da çıkarılır). x/y 'data' altında iç içe de olabilir. "
+    "Örn: {\"kind\":\"bar\",\"x\":[\"2019\",\"2020\"],\"y\":[10,12],\"title\":\"Gelir\"}",
+)
+def visualize_data(spec):
+    import json
+    import uuid
+    import matplotlib
+    matplotlib.use("Agg")            # başsız (GUI'siz) çizim
+    import matplotlib.pyplot as plt
+
+    try:
+        data = json.loads(spec)
+    except Exception:
+        return ('HATA: girdi JSON olmalı, ör. '
+                '{"kind":"bar","x":["2019","2020"],"y":[10,12],"title":"Gelir"}')
+    if not isinstance(data, dict):
+        return "HATA: JSON bir nesne (dict) olmalı."
+
+    # x/y doğrudan ya da 'data' altında iç içe olabilir.
+    inner = data.get("data") if isinstance(data.get("data"), dict) else data
+    x = inner.get("x") or inner.get("labels") or inner.get("categories")
+    y = inner.get("y") or inner.get("values")
+    if not isinstance(y, list) or not y:
+        return "HATA: 'y' (sayısal değerler listesi) gerekli."
+    if not isinstance(x, list) or not x:
+        x = [str(i + 1) for i in range(len(y))]
+    try:
+        yv = [float(v) for v in y]
+    except Exception:
+        return "HATA: 'y' değerleri sayısal olmalı."
+    xl = [str(v) for v in x]
+
+    # Grafik türü: açık 'kind' ya da instruction/title'dan çıkar.
+    kind = (data.get("kind") or data.get("type") or "").lower()
+    hint = f"{data.get('instruction', '')} {data.get('title', '')}".lower()
+    if kind not in ("bar", "line", "pie"):
+        # Açık tür kelimeleri önce (ör. "bar chart ... trend" → bar, line değil).
+        if "pie" in hint or "pasta" in hint:
+            kind = "pie"
+        elif "bar" in hint or "çubuk" in hint or "sütun" in hint:
+            kind = "bar"
+        elif "line" in hint or "çizgi" in hint:
+            kind = "line"
+        elif "trend" in hint:      # zayıf ipucu: yalnızca açık tür yoksa
+            kind = "line"
+        else:
+            kind = "bar"
+    title = str(data.get("title") or data.get("instruction") or "Grafik")[:100]
+
+    os.makedirs(CHARTS_DIR, exist_ok=True)
+    path = os.path.join(CHARTS_DIR, f"viz_{kind}_{uuid.uuid4().hex[:6]}.png")
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    try:
+        if kind == "pie":
+            ax.pie(yv, labels=xl, autopct="%1.1f%%")
+        elif kind == "line":
+            ax.plot(xl, yv, marker="o")
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.bar(xl, yv)
+        ax.set_title(title)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        fig.savefig(path, dpi=100)
+    finally:
+        plt.close(fig)
+    return f"Grafik kaydedildi ({kind}, {len(yv)} nokta): {path}"
+
+
 def render_tool_descriptions():
     """Sistem prompt'una gömmek için araç listesini metne çevirir."""
     return "\n".join(f"- {name}: {info['description']}" for name, info in TOOLS.items())
