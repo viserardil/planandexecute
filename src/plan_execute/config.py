@@ -61,7 +61,8 @@ class Settings:
     api_key: str | None = field(
         default_factory=lambda: _first(
             "LLM_API_KEY", "HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN",
-            "OPENAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY",
+            "OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY",
+            "ANTHROPIC_API_KEY", "GROQ_API_KEY",
         )
     )
     temperature: float = field(default_factory=lambda: float(os.getenv("TEMPERATURE", "0.1")))
@@ -97,6 +98,25 @@ def get_llm(**overrides):
             "LLM API anahtarı bulunamadı. .env'e LLM_API_KEY=<anahtar> ekle "
             "(HF için HF_TOKEN da olur)."
         )
+
+    # Azure OpenAI: standart OpenAI'den ayrı (deployment + api-version + api-key
+    # header). AzureChatOpenAI kullanılır. Gereken env: AZURE_OPENAI_ENDPOINT,
+    # AZURE_OPENAI_API_KEY, OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT (ya da LLM_MODEL).
+    if settings.provider in ("azure", "azure_openai"):
+        from langchain_openai import AzureChatOpenAI
+
+        aparams = dict(
+            azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT") or settings.model_name,
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT") or settings.base_url,
+            api_version=os.getenv("OPENAI_API_VERSION") or os.getenv("AZURE_OPENAI_API_VERSION") or "2024-10-21",
+            api_key=settings.api_key,
+            temperature=settings.temperature,
+            max_tokens=settings.max_tokens,
+            timeout=settings.timeout,
+            max_retries=settings.max_retries,
+        )
+        aparams.update(overrides)
+        return AzureChatOpenAI(**aparams)
 
     params = dict(
         model=settings.model_name,

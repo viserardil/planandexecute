@@ -146,6 +146,15 @@ yerine geçer (hiçbir şey ayarlanmazsa HF Router'a düşer):
 `https://api.groq.com/openai/v1` · OpenRouter `https://openrouter.ai/api/v1` ·
 yerel Ollama `http://localhost:11434/v1`.
 
+**Azure OpenAI** (deployment + api-version + `api-key` header ile OpenAI'den ayrı):
+```env
+LLM_PROVIDER=azure_openai
+AZURE_OPENAI_ENDPOINT=https://<kaynak-adin>.openai.azure.com
+AZURE_OPENAI_API_KEY=<key>
+OPENAI_API_VERSION=2024-10-21
+AZURE_OPENAI_DEPLOYMENT=<deployment-adin>   # Azure'da model değil, DEPLOYMENT adı
+```
+
 > Sistem structured output (planner/replanner) + tool-calling (executor) kullanır;
 > seçtiğin model ikisini de desteklemeli. **Benchmark kıyası** için iki tarafı da
 > (plan-execute + react_scratch) **aynı** modele almayı unutma.
