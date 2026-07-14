@@ -1,25 +1,3 @@
-"""Plan-Execute ajanı için CANLI eval koşucusu — HuggingFace dataset'inden test case'leri.
-
-Test case'leri "sccaglayanworkacc/equity-research-agentic-eval" dataset'inin
-`query` sorularından okur, her birini gerçek bir HF Router modeline karşı
-çalıştırır ve sonucu test/a.json'daki v2.0.0 RunResult şemasına uygun JSON olarak
-kaydeder. Beklenti/doğrulama YOK: olgu (trace + metrik) toplar; doğru/yanlış
-değerlendirmesini sen çıktı JSON'undan yaparsın. ReAct tarafıyla (Staj_react_scratch)
-AYNI dataset, AYNI şema — çıktılar doğrudan karşılaştırılabilir.
-
-Kurulum:
-    uv sync                                  # bağımlılıklar (datasets, jsonschema ...)
-    .env içinde HF_TOKEN (ve isteğe bağlı HF_MODEL)
-
-Çalıştırma (terminalden):
-    uv run python test/test.py --limit 5            # ilk 5 query
-    uv run python test/test.py --index 0 3 7        # sadece 0,3,7. query'ler
-    uv run python test/test.py --list               # query'leri listele, çalıştırma
-    uv run python test/test.py --limit 5 --validate # çıktıyı a.json şemasıyla doğrula
-    uv run python test/test.py --version denemem     # çıktı dosya etiketi
-
-HF_TOKEN yoksa hata verir. Çıktılar test/results/ altına yazılır.
-"""
 
 from __future__ import annotations
 
@@ -323,7 +301,7 @@ class EvalRunner:
         ok = sum(1 for s in self.summaries if s["success"])
         summary_payload = {
             "test_name": self.version,          # koşunun adı (en başta)
-            "model": self.model or "(env HF_MODEL)",
+            "model": self.model or "(env LLM_MODEL)",
             "dataset": DATASET_NAME, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "total": n, "succeeded": ok,
             "avg_steps": round(sum(s["steps"] for s in self.summaries) / n, 2) if n else 0,
@@ -379,7 +357,7 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=None, help="İlk N query'yi çalıştır.")
     p.add_argument("--index", type=int, nargs="+", help="Sadece bu index'lerdeki query'ler.")
     p.add_argument("--list", action="store_true", help="Query'leri listele, çalıştırma.")
-    p.add_argument("--model", default=None, help="Model (varsayılan: env HF_MODEL).")
+    p.add_argument("--model", default=None, help="Model (varsayılan: env LLM_MODEL).")
     p.add_argument("--max-steps", type=int, default=50, help="Graf özyineleme sınırı (recursion_limit).")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--framework", default="plan-execute", help="Şemadaki framework etiketi.")
@@ -390,18 +368,20 @@ def main() -> int:
     p.add_argument("--max-chars", type=int, default=0,
                    help="Schema JSON'unda uzun tool çıktısı/adım metnini N karakterde kırp "
                         "(0=sınırsız). final_answer ASLA kırpılmaz (scorer ona bakar).")
+    p.add_argument("--pace", type=float, default=0,
+                   help="Vakalar arası N sn bekle — düşük TPM limitli hesaplarda 429'ları önler (ör. 20).")
     p.add_argument("--validate", action="store_true", help="Çıktıyı a.json şemasıyla doğrula.")
     args = p.parse_args()
 
     import os
-    if not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")):
-        print("HATA: HF_TOKEN tanımlı değil (.env'e ekle).", file=sys.stderr)
+    if not (os.environ.get("LLM_API_KEY") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")):
+        print("HATA: LLM_API_KEY tanımlı değil (.env'e ekle).", file=sys.stderr)
         return 1
 
     # Model/sıcaklık config.settings tarafından import anında env'den okunur;
     # bu yüzden EvalRunner (dolayısıyla config) kurulmadan ÖNCE env'e yaz.
     if args.model:
-        os.environ["HF_MODEL"] = args.model
+        os.environ["LLM_MODEL"] = args.model
     os.environ["TEMPERATURE"] = str(args.temperature)
 
     print(f"Dataset yükleniyor: {args.dataset} ...")
@@ -433,6 +413,10 @@ def main() -> int:
     try:
         for pos, case in enumerate(cases, 1):
             runner.run_case(case, pos, len(cases))
+            # Vakalar arası bekleme: düşük TPM (token/dakika) limitli hesaplarda
+            # 429'ları önlemek için (ör. --pace 20). Son vakada bekleme.
+            if args.pace and pos < len(cases):
+                time.sleep(args.pace)
     except KeyboardInterrupt:
         print("\nKullanıcı durdurdu; şu ana kadarki sonuçlar kaydediliyor…", file=sys.stderr)
 
