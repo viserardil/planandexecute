@@ -195,6 +195,25 @@ Eval çıktıları `test/results/` altına yazılır:
 
 ---
 
+## Sohbet arayüzü (app.py)
+
+Ajanı tarayıcıdan interaktif denemek için basit bir sohbet arayüzü:
+
+```powershell
+$env:UV_LINK_MODE = "copy"
+uv run python app.py          # → http://127.0.0.1:8000   (PORT / HOST env ile değişir)
+```
+
+- **FastAPI** (`app.py`) kök dizindeki `index.html` React arayüzünü sunar; `/api/chat`
+  ajanı çalıştırır, `/api/reset` belleği siler.
+- **Kısa süreli bellek:** aynı sohbette (thread) önceki turlar hatırlanır — son 5
+  (soru, cevap) çifti planner'a bağlam olarak eklenir; **🗑 Temizle** ile sıfırlanır
+  (`PlanExecuteAgent._memory`, thread_id bazlı). Eval kipinde (thread_id yok) devre dışı.
+- Cevabın altında **"adımları göster"** ile plan + araç çağrılarının ayrıntısı görünür
+  (test live-log'uyla aynı format).
+
+---
+
 ## Toplanan metrikler
 
 | Metrik | Anlamı |
