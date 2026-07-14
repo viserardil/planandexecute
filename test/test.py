@@ -1,3 +1,15 @@
+"""Plan-Execute ajanı için CANLI eval koşucusu — HuggingFace dataset'inden test case'leri.
+
+Dataset'in `query` sorularını okur, her birini gerçek bir LLM'e (SAĞLAYICI-BAĞIMSIZ —
+LLM_API_KEY / HF_TOKEN / OPENAI_API_KEY… herhangi biri) karşı çalıştırır ve sonucu
+test/a.json v2.0.0 RunResult şemasına uygun JSON olarak kaydeder. Doğru/yanlış
+değerlendirmesi burada YAPILMAZ (olgu toplar; skoru test/score.py üretir). ReAct
+tarafıyla (Staj_react_scratch) AYNI dataset/şema — çıktılar doğrudan karşılaştırılabilir.
+
+Çalıştırma:
+    uv run python test/test.py --limit 5 --validate
+    uv run python test/test.py --version pe-v1 --pace 20
+"""
 
 from __future__ import annotations
 
