@@ -98,3 +98,12 @@ def reset(body: ResetIn) -> dict:
     """Bir thread'in kısa süreli belleğini siler ('Temizle' butonu)."""
     removed = agent.reset_memory(body.thread_id) if body.thread_id else False
     return {"ok": True, "removed": removed}
+
+
+if __name__ == "__main__":
+    # Doğrudan çalıştırma: `uv run python app.py` → http://127.0.0.1:8000
+    # Port/host env'den de ayarlanabilir (PORT / HOST).
+    import uvicorn
+
+    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"),
+                port=int(os.getenv("PORT", "8000")))
