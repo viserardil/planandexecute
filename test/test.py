@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# .env'i erken yükle ki HF_TOKEN/HF_MODEL hem burada hem ajanda okunsun.
+# .env'i erken yükle ki LLM anahtarı/modeli hem burada hem ajanda okunsun.
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -374,8 +374,13 @@ def main() -> int:
     args = p.parse_args()
 
     import os
-    if not (os.environ.get("LLM_API_KEY") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")):
-        print("HATA: LLM_API_KEY tanımlı değil (.env'e ekle).", file=sys.stderr)
+    # Sağlayıcı-bağımsız: config'in kabul ettiği anahtarlardan HERHANGİ biri yeterli.
+    _KEY_ENVS = ("LLM_API_KEY", "HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN", "OPENAI_API_KEY",
+                 "AZURE_OPENAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY",
+                 "ANTHROPIC_API_KEY", "GROQ_API_KEY")
+    if not any(os.environ.get(k) for k in _KEY_ENVS):
+        print("HATA: Bir LLM API anahtarı yok. .env'e LLM_API_KEY=<anahtar> ekle "
+              "(OpenAI için OPENAI_API_KEY, HF için HF_TOKEN da olur).", file=sys.stderr)
         return 1
 
     # Model/sıcaklık config.settings tarafından import anında env'den okunur;

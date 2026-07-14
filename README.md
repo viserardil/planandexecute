@@ -111,21 +111,27 @@ Staj_plan_execute/
 # OneDrive altında hardlink desteklenmediği için copy modu gerekir:
 $env:UV_LINK_MODE = "copy"
 uv sync
-# .env dosyası oluştur ve içine en az HF_TOKEN yaz (aşağıdaki tabloya bak).
+# .env oluştur; içine EN AZ bir LLM API anahtarı yaz (LLM_API_KEY / HF_TOKEN / OPENAI_API_KEY…).
 ```
 
 ---
 
 ## Ortam değişkenleri (.env)
 
-| Değişken | Açıklama |
-|----------|----------|
-| `HF_TOKEN` | **Zorunlu.** HuggingFace Router API anahtarı. |
-| `HF_MODEL` | Model adı (varsayılan `Qwen/Qwen3.5-122B-A10B:deepinfra`). **Sağlayıcı sabit tutulmalı:** HF Router bu modeli novita + deepinfra'ya dağıtır; **novita structured output'u desteklemez → 400**. `:deepinfra` bunu deterministik yapar. |
-| `HF_BASE_URL` | Router endpoint'i (varsayılan `https://router.huggingface.co/v1`). |
-| `TAVILY_API_KEY` | `web_search` aracı için internet araması (Tavily REST). |
-| `TEMPERATURE` / `MAX_TOKENS` | Örnekleme ve yanıt sınırı (eval `test.py` sıcaklığı 0'a zorlar). |
-| `RECURSION_LIMIT` | Graf özyineleme güvenlik sınırı (varsayılan 50). |
+> **Zorunlu olan tek şey bir LLM API anahtarıdır** — `LLM_API_KEY` ya da eşdeğeri
+> (`HF_TOKEN`, `OPENAI_API_KEY`, `AZURE_OPENAI_API_KEY`, `GOOGLE_API_KEY`… herhangi
+> biri). Geri kalan her şey **opsiyoneldir** (varsayılanları var). Aşağıdaki tablo HF
+> Router ile hızlı başlangıç içindir; başka sağlayıcı için alttaki
+> **"Farklı LLM sağlayıcısı"** bölümüne bak.
+
+| Değişken | Zorunlu? | Açıklama |
+|----------|:--------:|----------|
+| `HF_TOKEN` | anahtarlardan **biri** | HuggingFace Router anahtarı. OpenAI kullanıyorsan bunun yerine `LLM_API_KEY`/`OPENAI_API_KEY` yeter. |
+| `HF_MODEL` | opsiyonel | Model adı (varsayılan `Qwen/Qwen3.5-122B-A10B:deepinfra`). **Sağlayıcı sabit:** HF Router bu modeli novita + deepinfra'ya dağıtır; novita structured output'u desteklemez → 400; `:deepinfra` deterministik yapar. |
+| `HF_BASE_URL` | opsiyonel | Router endpoint'i (varsayılan `https://router.huggingface.co/v1`). |
+| `TAVILY_API_KEY` | opsiyonel | Yalnızca `web_search` aracı için. Yoksa o araç devre dışı kalır, sistem çalışmaya devam eder. |
+| `TEMPERATURE` / `MAX_TOKENS` | opsiyonel | Örnekleme/yanıt sınırı (varsayılan 0.1 / 4096; eval `test.py` sıcaklığı 0'a zorlar). |
+| `RECURSION_LIMIT` | opsiyonel | Graf özyineleme güvenlik sınırı (varsayılan 50). |
 
 ### Farklı LLM sağlayıcısı (sağlayıcı-bağımsız)
 
