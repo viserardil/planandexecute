@@ -57,25 +57,30 @@ böylece tek değişken mimaridir.
 
 | Konu | Ortak değer |
 |------|-------------|
-| **Model / sağlayıcı** | HF Router (OpenAI-uyumlu), `HF_MODEL=Qwen/Qwen3.5-122B-A10B:deepinfra` (sağlayıcı **sabitlendi** — aşağıdaki nota bak), `temperature=0`, `max_tokens=4096` |
-| **Araçlar** | `src/plan_execute/tools.py`, react_scratch'in `react_agent/tools.py`'siyle **byte-byte aynı** — 17 yfinance/web aracı. `get_tools()` bunları LangChain'e sarıp executor'a verir. |
+| **Model / sağlayıcı** | İki tarafta da **aynı** model + endpoint (`.env` ile seçilir), `temperature=0`, `max_tokens=4096`. Kıyas koşuları OpenAI ve HF Router/Qwen ile ayrı ayrı yapıldı; bulgular her ikisinde de aynı yöndeydi (bkz. `rapor/RAPOR.md` §7). |
+| **Araçlar** | `src/plan_execute/tools.py`, react_scratch'in `react_agent/tools.py`'siyle **byte-byte aynı** — 18 yfinance/web aracı. `get_tools()` bunları LangChain'e sarıp executor'a verir. |
 | **Görev seti** | HF `sccaglayanworkacc/equity-research-agentic-eval` — **55 soru** (tier T1–T5 + Edge; dil EN 33 / TR 22) |
 | **Metrikler** | success, status, steps/llm_calls, plan_steps, replan_count, tool_calls, tools_used, input/output/total_tokens, duration_ms, trace |
 | **Çıktı şeması** | `test/a.json` — RunResult v2.0.0 (run → agents → steps → tool_calls/llm_calls); iki tarafta ortak |
 
-**Araç seti (17):** `get_current_stock_price`, `get_historical_stock_prices`,
+**Araç seti (18):** `get_current_stock_price`, `get_historical_stock_prices`,
 `get_stock_fundamentals`, `get_key_financial_ratios`, `get_income_statements`,
 `get_quarterly_income_statements`, `get_balance_sheet`, `get_cash_flow`,
 `get_analyst_recommendations`, `get_technical_indicators`, `get_company_info`,
 `get_company_news`, `compare_stocks`, `resolve_ticker`, `web_search`, `plot_chart`,
-`calculator`.
+`visualize_data`, `calculator`.
+
+> **İki çizim aracı:** `plot_chart` hisse fiyat/gelir grafiği çizer (sembolden
+> yfinance verisi çeker); `visualize_data` ise ELDEKİ ham sayısal veriyi (x/y listesi)
+> çizer. İkisi de PNG kaydedip yolunu döner.
 
 > **Ad farkı notu:** Dataset'in altın-anahtarları (`expected_tools`,
-> `reference_trace`) `get_stock_price`, `get_historical_prices`, `visualize_data`
-> adlarını kullanır; `tools.py`'da bunların karşılığı sırasıyla
-> `get_current_stock_price`, `get_historical_stock_prices`, `plot_chart`'tır. İki
-> mimari de aynı `tools.py`'ı kullandığı için **karşılaştırma adil kalır**; yalnızca
-> scorer dataset adlarına bakarsa bu eşleme akılda tutulmalı.
+> `reference_trace`) `get_stock_price` ve `get_historical_prices` adlarını kullanır;
+> `tools.py`'da bunların karşılığı sırasıyla `get_current_stock_price` ve
+> `get_historical_stock_prices`'tır. Dataset'in `visualize_data`'sı ise **birebir aynı
+> adla** mevcut — eşleme gerekmez. İki mimari de aynı `tools.py`'ı kullandığı için
+> **karşılaştırma adil kalır**; yalnızca scorer dataset adlarına bakarsa bu iki eşleme
+> akılda tutulmalı.
 
 ---
 
@@ -111,24 +116,27 @@ Staj_plan_execute/
 # OneDrive altında hardlink desteklenmediği için copy modu gerekir:
 $env:UV_LINK_MODE = "copy"
 uv sync
-# .env oluştur; içine EN AZ bir LLM API anahtarı yaz (LLM_API_KEY / HF_TOKEN / OPENAI_API_KEY…).
+# .env oluştur; içine EN AZ bir LLM API anahtarı (LLM_API_KEY / HF_TOKEN / OPENAI_API_KEY…)
+# ve bir model adı (LLM_MODEL) yaz. Şablon için env.example'a bak.
 ```
 
 ---
 
 ## Ortam değişkenleri (.env)
 
-> **Zorunlu olan tek şey bir LLM API anahtarıdır** — `LLM_API_KEY` ya da eşdeğeri
-> (`HF_TOKEN`, `OPENAI_API_KEY`, `AZURE_OPENAI_API_KEY`, `GOOGLE_API_KEY`… herhangi
-> biri). Geri kalan her şey **opsiyoneldir** (varsayılanları var). Aşağıdaki tablo HF
-> Router ile hızlı başlangıç içindir; başka sağlayıcı için alttaki
+> **Zorunlu iki şey var: bir LLM API anahtarı ve bir model adı.** Anahtar için
+> `LLM_API_KEY` ya da eşdeğeri (`HF_TOKEN`, `OPENAI_API_KEY`, `AZURE_OPENAI_API_KEY`,
+> `GOOGLE_API_KEY`… herhangi biri); model için `LLM_MODEL` (ya da eski adıyla
+> `HF_MODEL`). İkisinden biri eksikse `get_llm()` açık bir hata verir — sessizce bir
+> varsayılana düşmez. Geri kalanı **opsiyoneldir**. Sağlayıcı seçimi için alttaki
 > **"Farklı LLM sağlayıcısı"** bölümüne bak.
 
 | Değişken | Zorunlu? | Açıklama |
 |----------|:--------:|----------|
-| `HF_TOKEN` | anahtarlardan **biri** | HuggingFace Router anahtarı. OpenAI kullanıyorsan bunun yerine `LLM_API_KEY`/`OPENAI_API_KEY` yeter. |
-| `HF_MODEL` | opsiyonel | Model adı (varsayılan `Qwen/Qwen3.5-122B-A10B:deepinfra`). **Sağlayıcı sabit:** HF Router bu modeli novita + deepinfra'ya dağıtır; novita structured output'u desteklemez → 400; `:deepinfra` deterministik yapar. |
-| `HF_BASE_URL` | opsiyonel | Router endpoint'i (varsayılan `https://router.huggingface.co/v1`). |
+| `LLM_API_KEY` | **evet** (ya da eşdeğeri) | Sağlayıcının anahtarı. `HF_TOKEN`, `OPENAI_API_KEY`, `AZURE_OPENAI_API_KEY`, `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY` de kabul edilir (ilk dolu olan kullanılır). |
+| `LLM_MODEL` | **evet** | Model adı (ör. `gpt-4o-mini`, `Qwen/Qwen3.5-122B-A10B:deepinfra`). `HF_MODEL` de okunur. Varsayılanı **yoktur**. |
+| `LLM_BASE_URL` | opsiyonel | Sağlayıcının OpenAI-uyumlu endpoint'i. `HF_BASE_URL` de okunur. Boş bırakılırsa OpenAI'ye (`api.openai.com`) gider. |
+| `LLM_TIMEOUT` / `LLM_MAX_RETRIES` | opsiyonel | Tek LLM çağrısı zaman aşımı (sn) ve yeniden deneme (varsayılan 90 / 2). Sağlayıcı askıya alırsa koşu bloklanmasın diye. |
 | `TAVILY_API_KEY` | opsiyonel | Yalnızca `web_search` aracı için. Yoksa o araç devre dışı kalır, sistem çalışmaya devam eder. |
 | `TEMPERATURE` / `MAX_TOKENS` | opsiyonel | Örnekleme/yanıt sınırı (varsayılan 0.1 / 4096; eval `test.py` sıcaklığı 0'a zorlar). |
 | `RECURSION_LIMIT` | opsiyonel | Graf özyineleme güvenlik sınırı (varsayılan 50). |
@@ -136,8 +144,8 @@ uv sync
 ### Farklı LLM sağlayıcısı (sağlayıcı-bağımsız)
 
 Sistem herhangi bir sağlayıcının anahtarıyla çalışır. Çoğu sağlayıcı **OpenAI-uyumlu**
-bir endpoint sunduğu için genelde üç değişken yeter; bunlar ayarlanırsa `HF_*`'ın
-yerine geçer (hiçbir şey ayarlanmazsa HF Router'a düşer):
+bir endpoint sunduğu için genelde üç değişken yeter; bunlar ayarlanırsa eski `HF_*`
+adlarının yerine geçer:
 
 | Değişken | Açıklama |
 |----------|----------|
@@ -146,6 +154,12 @@ yerine geçer (hiçbir şey ayarlanmazsa HF Router'a düşer):
 | `LLM_BASE_URL` | Sağlayıcının OpenAI-uyumlu endpoint'i. |
 | `LLM_PROVIDER` | (Opsiyonel) `openai` (varsayılan) yerine `google_genai`/`anthropic`/… → native entegrasyon (paketi kurulmalı). |
 | `LLM_STRUCTURED_METHOD` | (Opsiyonel) Sağlayıcı `json_schema` desteklemiyorsa `function_calling` veya `json_mode`. |
+
+> **HF Router / Qwen gotcha'sı:** HF Router `Qwen/Qwen3.5-122B-A10B`'yi novita **ve**
+> deepinfra'ya dağıtır; novita structured output'u desteklemez → 400. Model adına
+> `:deepinfra` son ekini ekleyerek sağlayıcıyı sabitle
+> (`LLM_MODEL=Qwen/Qwen3.5-122B-A10B:deepinfra`) — planner/replanner structured output
+> kullandığı için bu şart.
 
 Örnek base_url'ler: OpenAI `https://api.openai.com/v1` · Gemini
 `https://generativelanguage.googleapis.com/v1beta/openai/` · Groq
