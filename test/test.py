@@ -1,0 +1,467 @@
+"""Plan-Execute ajanı için CANLI eval koşucusu — HuggingFace dataset'inden test case'leri.
+
+Dataset'in `query` sorularını okur, her birini gerçek bir LLM'e (SAĞLAYICI-BAĞIMSIZ —
+LLM_API_KEY / HF_TOKEN / OPENAI_API_KEY… herhangi biri) karşı çalıştırır ve sonucu
+test/a.json v2.0.0 RunResult şemasına uygun JSON olarak kaydeder. Doğru/yanlış
+değerlendirmesi burada YAPILMAZ (olgu toplar; skoru test/score.py üretir). ReAct
+tarafıyla (Staj_react_scratch) AYNI dataset/şema — çıktılar doğrudan karşılaştırılabilir.
+
+Çalıştırma:
+    uv run python test/test.py --limit 5 --validate
+    uv run python test/test.py --version pe-v1 --pace 20
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import re
+import sys
+import time
+import traceback
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+# .env'i erken yükle ki LLM anahtarı/modeli hem burada hem ajanda okunsun.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# Proje kökünü import edilebilir yap (test/ dizininden doğrudan çalıştırma için).
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+DATASET_NAME = "sccaglayanworkacc/equity-research-agentic-eval"
+SCHEMA_PATH = ROOT_DIR / "test" / "a.json"
+DEFAULT_OUTPUT_DIR = ROOT_DIR / "test" / "results"
+# Query metnini bu alan adlarından birinde arar (dataset şeması bilinmiyorsa).
+QUERY_FIELD_CANDIDATES = ("query", "question", "prompt", "input", "task")
+
+
+# --- Test case modeli -------------------------------------------------------
+
+
+@dataclass
+class Case:
+    index: int
+    case_id: str
+    prompt: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+# --- Dataset yükleme --------------------------------------------------------
+
+
+def _pick_query_field(columns: list[str], override: str | None) -> str:
+    if override:
+        if override not in columns:
+            raise SystemExit(f"'{override}' alanı dataset'te yok. Mevcut alanlar: {columns}")
+        return override
+    for cand in QUERY_FIELD_CANDIDATES:
+        if cand in columns:
+            return cand
+    raise SystemExit(
+        f"Query alanı bulunamadı. Mevcut alanlar: {columns}. "
+        f"--query-field ile elle belirt."
+    )
+
+
+def load_cases(dataset_name: str, split: str | None, query_field: str | None,
+               limit: int | None) -> list[Case]:
+    """Dataset'i indirir ve query sorularını Case listesine çevirir."""
+    from datasets import load_dataset
+
+    ds = load_dataset(dataset_name)  # HF_TOKEN env'den otomatik okunur
+    # split seçimi: verilmişse onu, yoksa ilk mevcut split'i kullan.
+    if hasattr(ds, "keys"):  # DatasetDict
+        available = list(ds.keys())
+        chosen = split or available[0]
+        if chosen not in ds:
+            raise SystemExit(f"'{chosen}' split'i yok. Mevcut split'ler: {available}")
+        data = ds[chosen]
+    else:  # zaten tek Dataset
+        data = ds
+
+    columns = list(data.column_names)
+    qfield = _pick_query_field(columns, query_field)
+    # case_id için makul bir alan ara (yoksa index kullanılır).
+    id_field = next((c for c in ("id", "case_id", "task_id", "ticker") if c in columns), None)
+
+    cases: list[Case] = []
+    n = len(data) if limit is None else min(limit, len(data))
+    for i in range(n):
+        row = data[i]
+        prompt = str(row.get(qfield, "")).strip()
+        if not prompt:
+            continue
+        case_id = str(row.get(id_field)) if id_field else f"case-{i:04d}"
+        # metadata: query dışındaki tüm alanlar (ticker/category/difficulty vs.)
+        meta = {k: row[k] for k in columns if k != qfield}
+        cases.append(Case(index=i, case_id=case_id, prompt=prompt, metadata=meta))
+    return cases
+
+
+# --- Yardımcılar ------------------------------------------------------------
+
+
+def _ensure_utf8_stdout() -> None:
+    if sys.platform == "win32":
+        try:
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _one_line(value: Any, limit: int = 200) -> str:
+    text = "" if value is None else str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _slugify(name: str) -> str:
+    name = re.sub(r"\s+", "_", name.strip().lower())
+    return re.sub(r"[^a-z0-9_\-]", "", name).strip("_-")
+
+
+def serialize_trace(trace: list) -> list[dict[str, Any]]:
+    """Plan-Execute izini (yürütülen plan adımı + executor sonucu) okunası özet
+    JSON'una çevirir — planın nasıl ilerlediğini görebilmek için."""
+    steps: list[dict[str, Any]] = []
+    for i, s in enumerate(trace, 1):
+        steps.append({
+            "adim": i,
+            "step": getattr(s, "step", None),      # plan adımının metni
+            "result": getattr(s, "result", None),  # executor'ın o adımdaki sonucu
+        })
+    return steps
+
+
+def ask_test_name(fallback_prefix: str = "run") -> str:
+    """Koşu adını terminalden sorar; boş girilirse zaman damgası kullanır."""
+    fallback = time.strftime(f"{fallback_prefix}_%Y%m%d_%H%M%S")
+    try:
+        raw = input(f"Bu test koşusu için bir isim gir [{fallback}]: ")
+    except EOFError:
+        raw = ""
+    return _slugify(raw) or fallback
+
+
+# --- Koşucu -----------------------------------------------------------------
+
+
+class EvalRunner:
+    def __init__(self, version: str, output_dir: Path, model: str | None,
+                 max_steps: int, temperature: float, is_synthetic: bool,
+                 framework: str, progress: bool = True, max_chars: int = 0):
+        self.version = version
+        self.output_dir = output_dir
+        self.model = model
+        self.max_steps = max_steps
+        self.temperature = temperature
+        self.is_synthetic = is_synthetic
+        self.framework = framework
+        self.progress = progress
+        self.max_chars = max_chars   # >0 ise schema JSON'unda uzun çıktıları kırp
+        self._started_at = time.time()
+
+        self.summaries: list[dict[str, Any]] = []   # okunası özet
+        self.schemas: list[dict[str, Any]] = []      # a.json'a uygun RunResult'lar
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.progress_path = self.output_dir / f"progress_{version}.jsonl"
+        # Canlı, insan-okur log: her vaka başlayınca/bitince satır eklenir; her
+        # yazımdan sonra flush edilir, böylece editörde açık tutup ANLIK izleyebilirsin.
+        self.live_path = self.output_dir / f"live_{version}.log"
+        if progress:
+            self.progress_path.write_text("", encoding="utf-8")
+            from plan_execute.config import settings
+            self.live_path.write_text(
+                f"=== PLAN-EXECUTE EVAL — '{version}' — {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+                f"model={settings.model_name}  framework={framework}  dataset={DATASET_NAME}\n"
+                f"(bu dosya canlı güncellenir — açık bırakıp izleyebilirsin; `tail -f` de olur)\n\n",
+                encoding="utf-8",
+            )
+
+    def _event(self, obj: dict[str, Any]) -> None:
+        if not self.progress:
+            return
+        with self.progress_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.time(), **obj}, ensure_ascii=False) + "\n")
+
+    def _live(self, text: str) -> None:
+        """Canlı log dosyasına bir satır ekler (yaz + kapat = anında diske iner)."""
+        if not self.progress:
+            return
+        with self.live_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%H:%M:%S')}  {text}\n")
+
+    def run_case(self, case: Case, pos: int, total: int) -> None:
+        from plan_execute.agent import PlanExecuteAgent, build_detail_trace
+        from plan_execute.config import settings
+        from plan_execute.run_schema import to_run_result_schema
+
+        print(f"\n[{pos}/{total}] case_id={case.case_id}")
+        print(f"  PROMPT: {_one_line(case.prompt, 160)}")
+        self._event({"event": "case_start", "pos": pos, "total": total,
+                     "case_id": case.case_id, "prompt": case.prompt})
+        self._live(f"[{pos}/{total}] {case.case_id}  ▶ BAŞLADI  {_one_line(case.prompt, 140)}")
+
+        # Model/parametreler config'ten (env: HF_MODEL / TEMPERATURE / MAX_TOKENS).
+        # Deneyin kontrol değişkeni: iki mimaride de aynı olmalı.
+        model_name = settings.model_name
+        model_params = {"temperature": settings.temperature, "top_p": None,
+                        "seed": None, "max_tokens": settings.max_tokens}
+        agent = PlanExecuteAgent(recursion_limit=self.max_steps, verbose=False)
+
+        t0 = time.time()
+        try:
+            # Canlı ilerleme: her LLM/araç olayı bittiğinde live-log'a satır düş
+            # (vaka İÇİNDE görünürlük — "donmuş mu" belirsizliğini önler).
+            def _live_event(ev):
+                if ev.get("kind") == "tool":
+                    mark = "✅" if ev.get("success", True) else "❌"
+                    self._live(f"        · {ev.get('name')}({_one_line(str(ev.get('input', '')), 70)}) "
+                               f"{mark} {ev.get('duration_ms', 0):.0f}ms")
+                    if ev.get("output"):
+                        self._live(f"           → {_one_line(str(ev['output']), 200)}")
+                else:  # llm turu
+                    self._live(f"        · … LLM turu ({ev.get('duration_ms', 0) / 1000:.1f}s, "
+                               f"+{ev.get('output_tokens', 0)} tok)")
+
+            rr = agent.run(case.prompt, on_event=_live_event)
+            schema = to_run_result_schema(
+                rr, prompt=case.prompt, model=model_name, model_params=model_params,
+                case_id=case.case_id, framework=self.framework,
+                is_synthetic=self.is_synthetic, case_metadata=case.metadata or None,
+                obs_limit=self.max_chars or None,
+            )
+            summary = {
+                "case_id": case.case_id, "prompt": case.prompt,
+                "success": rr.success, "status": rr.status, "answer": rr.answer,
+                "steps": rr.steps, "tool_calls": rr.tool_calls,
+                "plan_steps": rr.plan_steps, "replan_count": rr.replan_count,
+                "tools_used": rr.tools_used, "total_tokens": rr.total_tokens,
+                "duration_ms": int(rr.elapsed_seconds * 1000), "error": None,
+                "trace": serialize_trace(rr.trace),   # yürütülen plan adımları
+            }
+            print(f"  -> {rr.status} | adım={rr.steps} plan={rr.plan_steps} "
+                  f"araç={rr.tool_calls} ({', '.join(rr.tools_used) or '-'}) "
+                  f"token={rr.total_tokens} süre={rr.elapsed_seconds:.1f}sn")
+            print(f"  CEVAP: {_one_line(rr.answer, 220)}")
+            icon = "✅" if rr.success else "⚠️"
+            self._live(f"[{pos}/{total}] {case.case_id}  {icon} {rr.status}  "
+                       f"adım={rr.steps} plan={rr.plan_steps} araç={rr.tool_calls} "
+                       f"({', '.join(rr.tools_used) or '-'}) token={rr.total_tokens} "
+                       f"süre={rr.elapsed_seconds:.1f}sn")
+            # Bitiş özeti: PLAN + CEVAP. (Araç çağrıları yukarıda CANLI aktı, burada
+            # tekrar etmiyoruz.)
+            for st in build_detail_trace(rr, obs_limit=220):
+                if st["adim"] == "Plan":
+                    self._live("        PLAN:")
+                    for line in (st["thought"] or "").splitlines():
+                        self._live(f"          {line}")
+            self._live(f"        CEVAP: {_one_line(rr.answer, 240)}")
+        except Exception as exc:  # ajan/ağ hatası: koşuyu düşürme, hatayı kaydet
+            err = f"{type(exc).__name__}: {exc}"
+            print(f"  -> HATA: {err}", file=sys.stderr)
+            traceback.print_exc()
+            self._live(f"[{pos}/{total}] {case.case_id}  ❌ HATA  {_one_line(err, 200)}")
+            schema = self._error_schema(case, model_name, model_params,
+                                        err, time.time() - t0)
+            summary = {
+                "case_id": case.case_id, "prompt": case.prompt, "success": False,
+                "status": "error", "answer": None, "steps": 0, "tool_calls": 0,
+                "plan_steps": 0, "replan_count": 0,
+                "tools_used": [], "total_tokens": 0,
+                "duration_ms": int((time.time() - t0) * 1000), "error": err,
+                "trace": [],
+            }
+
+        self.summaries.append(summary)
+        self.schemas.append(schema)
+        self._event({"event": "case_finish", "pos": pos, **summary})
+        self.save()  # her case sonrası kaydet (uzun koşuda ilerleme kaybolmasın)
+
+        done = len(self.summaries)
+        ok = sum(1 for s in self.summaries if s["success"])
+        errs = sum(1 for s in self.summaries if s.get("error"))
+        elapsed = int(time.time() - self._started_at)
+        self._live(f"--- İLERLEME: {done}/{total} tamam | {ok} başarılı | {errs} hata "
+                   f"| geçen {elapsed // 60}dk {elapsed % 60}sn ---\n")
+
+    def _error_schema(self, case, model_name, model_params, err, elapsed):
+        from plan_execute.agent import RunResult
+        from plan_execute.run_schema import to_run_result_schema
+        rr = RunResult(question=case.prompt, answer=None, success=False,
+                       status="error", elapsed_seconds=elapsed)
+        return to_run_result_schema(
+            rr, prompt=case.prompt, model=model_name, model_params=model_params,
+            case_id=case.case_id, framework=self.framework,
+            is_synthetic=self.is_synthetic, case_metadata=case.metadata or None,
+            error_info={"error_type": "run_exception", "error_message": err,
+                        "failed_step_id": None},
+            obs_limit=self.max_chars or None,
+        )
+
+    def save(self) -> tuple[Path, Path]:
+        # 1) Okunası özet + toplam istatistik
+        n = len(self.summaries)
+        ok = sum(1 for s in self.summaries if s["success"])
+        summary_payload = {
+            "test_name": self.version,          # koşunun adı (en başta)
+            "model": self.model or "(env LLM_MODEL)",
+            "dataset": DATASET_NAME, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "total": n, "succeeded": ok,
+            "avg_steps": round(sum(s["steps"] for s in self.summaries) / n, 2) if n else 0,
+            "avg_tokens": round(sum(s["total_tokens"] for s in self.summaries) / n, 1) if n else 0,
+            "avg_duration_ms": round(sum(s["duration_ms"] for s in self.summaries) / n, 1) if n else 0,
+            "results": self.summaries,
+        }
+        summary_path = self.output_dir / f"results_{self.version}.json"
+        summary_path.write_text(json.dumps(summary_payload, indent=2, ensure_ascii=False),
+                                encoding="utf-8")
+
+        # 2) a.json şemasına uygun RunResult dizisi (asıl eval çıktısı)
+        schema_path = self.output_dir / f"results_{self.version}_schema.json"
+        schema_path.write_text(json.dumps(self.schemas, indent=2, ensure_ascii=False),
+                               encoding="utf-8")
+        return summary_path, schema_path
+
+
+# --- Şema doğrulama (opsiyonel) ---------------------------------------------
+
+
+def validate_against_schema(schema_objects: list[dict]) -> bool:
+    """Üretilen her RunResult'ı test/a.json şemasıyla doğrular."""
+    import jsonschema
+
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+    all_ok = True
+    for i, obj in enumerate(schema_objects):
+        errors = sorted(validator.iter_errors(obj), key=lambda e: e.path)
+        if errors:
+            all_ok = False
+            print(f"\n[ŞEMA HATASI] #{i} (case_id={obj.get('case_id')}):", file=sys.stderr)
+            for e in errors[:5]:
+                loc = "/".join(str(p) for p in e.path)
+                print(f"  - {loc or '(kök)'}: {e.message}", file=sys.stderr)
+    if all_ok:
+        print(f"\n✅ Şema doğrulaması geçti: {len(schema_objects)} kayıt a.json'a uygun.")
+    else:
+        print("\n❌ Bazı kayıtlar şemaya uymuyor (yukarıda).", file=sys.stderr)
+    return all_ok
+
+
+# --- CLI --------------------------------------------------------------------
+
+
+def main() -> int:
+    _ensure_utf8_stdout()
+    p = argparse.ArgumentParser(description="Dataset query'leriyle canlı Plan-Execute eval koşucusu.")
+    p.add_argument("--dataset", default=DATASET_NAME, help="HF dataset adı.")
+    p.add_argument("--split", default=None, help="Dataset split'i (varsayılan: ilk mevcut).")
+    p.add_argument("--query-field", default=None, help="Query metninin alan adı (otomatik bulunur).")
+    p.add_argument("--limit", type=int, default=None, help="İlk N query'yi çalıştır.")
+    p.add_argument("--index", type=int, nargs="+", help="Sadece bu index'lerdeki query'ler.")
+    p.add_argument("--list", action="store_true", help="Query'leri listele, çalıştırma.")
+    p.add_argument("--model", default=None, help="Model (varsayılan: env LLM_MODEL).")
+    p.add_argument("--max-steps", type=int, default=50, help="Graf özyineleme sınırı (recursion_limit).")
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--framework", default="plan-execute", help="Şemadaki framework etiketi.")
+    p.add_argument("--synthetic", action="store_true", help="is_synthetic=true olarak işaretle.")
+    p.add_argument("--version", default=None, help="Çıktı dosya etiketi (varsayılan: zaman damgası).")
+    p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    p.add_argument("--no-progress", action="store_true", help="JSONL ilerleme akışını kapat.")
+    p.add_argument("--max-chars", type=int, default=0,
+                   help="Schema JSON'unda uzun tool çıktısı/adım metnini N karakterde kırp "
+                        "(0=sınırsız). final_answer ASLA kırpılmaz (scorer ona bakar).")
+    p.add_argument("--pace", type=float, default=0,
+                   help="Vakalar arası N sn bekle — düşük TPM limitli hesaplarda 429'ları önler (ör. 20).")
+    p.add_argument("--validate", action="store_true", help="Çıktıyı a.json şemasıyla doğrula.")
+    args = p.parse_args()
+
+    import os
+    # Sağlayıcı-bağımsız: config'in kabul ettiği anahtarlardan HERHANGİ biri yeterli.
+    _KEY_ENVS = ("LLM_API_KEY", "HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN", "OPENAI_API_KEY",
+                 "AZURE_OPENAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY",
+                 "ANTHROPIC_API_KEY", "GROQ_API_KEY")
+    if not any(os.environ.get(k) for k in _KEY_ENVS):
+        print("HATA: Bir LLM API anahtarı yok. .env'e LLM_API_KEY=<anahtar> ekle "
+              "(OpenAI için OPENAI_API_KEY, HF için HF_TOKEN da olur).", file=sys.stderr)
+        return 1
+
+    # Model/sıcaklık config.settings tarafından import anında env'den okunur;
+    # bu yüzden EvalRunner (dolayısıyla config) kurulmadan ÖNCE env'e yaz.
+    if args.model:
+        os.environ["LLM_MODEL"] = args.model
+    os.environ["TEMPERATURE"] = str(args.temperature)
+
+    print(f"Dataset yükleniyor: {args.dataset} ...")
+    cases = load_cases(args.dataset, args.split, args.query_field, args.limit)
+    if args.index:
+        wanted = set(args.index)
+        cases = [c for c in cases if c.index in wanted]
+    if not cases:
+        print("Çalıştırılacak query bulunamadı.", file=sys.stderr)
+        return 1
+
+    if args.list:
+        print(f"\n{len(cases)} query:")
+        for c in cases:
+            print(f"  [{c.index}] {c.case_id}: {_one_line(c.prompt, 120)}")
+        return 0
+
+    # Test adı: --version verilmişse onu, yoksa koşu başında terminalden sor.
+    version = _slugify(args.version) if args.version else ask_test_name()
+    runner = EvalRunner(
+        version=version, output_dir=args.output_dir, model=args.model,
+        max_steps=args.max_steps, temperature=args.temperature,
+        is_synthetic=args.synthetic, framework=args.framework,
+        progress=not args.no_progress, max_chars=args.max_chars,
+    )
+    print(f"\nKoşu '{version}' — {len(cases)} query (model={args.model or 'env HF_MODEL'}, "
+          f"max_steps={args.max_steps})")
+
+    try:
+        for pos, case in enumerate(cases, 1):
+            runner.run_case(case, pos, len(cases))
+            # Vakalar arası bekleme: düşük TPM (token/dakika) limitli hesaplarda
+            # 429'ları önlemek için (ör. --pace 20). Son vakada bekleme.
+            if args.pace and pos < len(cases):
+                time.sleep(args.pace)
+    except KeyboardInterrupt:
+        print("\nKullanıcı durdurdu; şu ana kadarki sonuçlar kaydediliyor…", file=sys.stderr)
+
+    summary_path, schema_path = runner.save()
+
+    # Okunası, satır-kaydırmasız metin raporu (uzun tool çıktıları/cevaplar sarılır).
+    report_path = args.output_dir / f"report_{version}.md"
+    try:
+        from report import render as _render_report
+        report_path.write_text(_render_report(runner.schemas, 100), encoding="utf-8")
+    except Exception as exc:  # rapor üretimi koşuyu düşürmesin
+        print(f"(Rapor üretilemedi: {exc})", file=sys.stderr)
+        report_path = None
+
+    ok = sum(1 for s in runner.summaries if s["success"])
+    print(f"\n{'='*60}")
+    print(f"Bitti: {len(runner.summaries)} query, {ok} başarılı.")
+    print(f"Özet:  {summary_path}")
+    print(f"Şema:  {schema_path}")
+    if report_path:
+        print(f"Rapor: {report_path}  (okunası, sarılmış)")
+
+    rc = 0
+    if args.validate:
+        if not validate_against_schema(runner.schemas):
+            rc = 2
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,136 @@
+# ==========================================================================
+#  Plan-Execute vs ReAct — .gitignore
+#  Push edilmemesi gereken dosyalar: sırlar, ortamlar, build çıktıları, cache
+# ==========================================================================
+
+# --------------------------------------------------------------------------
+#  Sırlar / ortam değişkenleri  (ASLA push etme — API key & endpoint burada)
+# --------------------------------------------------------------------------
+.env
+.env.*
+!.env.example          # şablon paylaşılabilir, istisna tut
+*.env
+secrets/
+*.key
+*.pem
+credentials.json
+
+# --------------------------------------------------------------------------
+#  Sanal ortamlar / uv
+# --------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+# uv.lock'u genelde COMMIT ETMEK istersin (tekrarlanabilir kurulum için).
+# Eğer kütüphane değil uygulama geliştiriyorsan lock'u tut; aşağıyı açma:
+# uv.lock
+
+# --------------------------------------------------------------------------
+#  Python cache / derleme çıktıları
+# --------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+downloads/
+develop-eggs/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+sdist/
+share/python-wheels/
+MANIFEST
+
+# --------------------------------------------------------------------------
+#  Test / kapsam / lint cache
+# --------------------------------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# --------------------------------------------------------------------------
+#  Jupyter / not defterleri
+# --------------------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# --------------------------------------------------------------------------
+#  LangGraph / LangChain / LLM artefaktları
+# --------------------------------------------------------------------------
+.langgraph_api/
+.langgraph/
+*.sqlite            # LangGraph checkpoint / SQLite persist
+*.db
+.cache/
+.chroma/            # olası vektör veritabanı
+.chromadb/
+
+# --------------------------------------------------------------------------
+#  Deney çıktıları / benchmark sonuçları  (büyük & yeniden üretilebilir)
+# --------------------------------------------------------------------------
+
+
+runs/
+
+*.log
+benchmark_results/
+
+traces/
+
+# --------------------------------------------------------------------------
+#  IDE / editör
+# --------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# --------------------------------------------------------------------------
+#  İşletim sistemi
+# --------------------------------------------------------------------------
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+# Linux
+*~
+.directory
+.Trash-*
+
+# --------------------------------------------------------------------------
+#  Geçici / yedek dosyalar
+# --------------------------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+*.old
+tmp/
+temp/
+scratch/

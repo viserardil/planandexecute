@@ -1,0 +1,22 @@
+# Plan-and-Execute — pip ile kurulum:  pip install -r requirements.txt
+# Birincil kaynak pyproject.toml + uv'dir; bu dosya pip kullananlar için eşdeğeridir
+# (sürüm kısıtları pyproject ile aynı tutulmalıdır).
+
+# --- Ajan / graf ---
+langgraph>=0.2.50
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+python-dotenv>=1.0.0
+
+# --- Ortak finans araçları (react_scratch ile birebir aynı tools.py) ---
+yfinance>=0.2.40         # borsa araçları
+matplotlib>=3.8.0        # visualize_data / plot_chart
+requests>=2.31.0         # web_search (Tavily REST)
+
+# --- Eval koşucusu (test/test.py) ve skorlayıcı (test/score.py) ---
+datasets>=2.19.0         # HuggingFace dataset yükleme
+jsonschema>=4.21.0       # a.json v2.0.0 şema doğrulama (--validate)
+
+# --- Sohbet UI sunucusu (app.py + index.html) ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
