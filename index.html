@@ -29,6 +29,9 @@
     .step { font-size:12.5px; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; white-space:pre-wrap; word-break:break-word; }
     .step .lbl { color:var(--accent); font-weight:600; }
     .step .obs { color:var(--muted); }
+    .charts { margin-top:10px; display:flex; flex-direction:column; gap:8px; }
+    .charts img { width:100%; border:1px solid var(--line); border-radius:8px; background:#fff; display:block; cursor:zoom-in; }
+    .charts .cap { font-size:11.5px; color:var(--muted); margin-top:3px; font-family: ui-monospace, monospace; }
     .empty { color:var(--muted); text-align:center; margin-top:40px; font-size:14px; }
     form { display:flex; gap:10px; padding:14px 18px; border-top:1px solid var(--line); }
     textarea { flex:1; resize:none; background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:10px; padding:10px 12px; font:inherit; font-size:14px; max-height:140px; }
@@ -61,12 +64,30 @@
       );
     }
 
-    // Ajanın bir cevabı: metin + metrikler + açılabilir trace
+    // Grafik araçlarının ürettiği PNG'ler (/charts/... URL'leri).
+    // Sunucu yalnızca diskte GERÇEKTEN var olan dosyaları gönderir.
+    function Charts({ urls }) {
+      return (
+        <div className="charts">
+          {urls.map(u => (
+            <div key={u}>
+              <a href={u} target="_blank" rel="noreferrer">
+                <img src={u} alt="ajanın ürettiği grafik" loading="lazy" />
+              </a>
+              <div className="cap">{u.split("/").pop()}</div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // Ajanın bir cevabı: metin + grafikler + metrikler + açılabilir trace
     function AgentMessage({ m }) {
       const [open, setOpen] = useState(false);
       return (
         <div className="msg agent">
           <div>{m.answer ?? "(cevap üretilemedi)"}</div>
+          {m.images && m.images.length > 0 && <Charts urls={m.images} />}
           <div className="metrics">
             <span>{m.success ? "✅ başarılı" : "⚠️ cevap yok"}</span>
             <span>adım <b>{m.steps}</b></span>
@@ -113,7 +134,7 @@
           const data = await res.json();
           setMessages(m => [...m, { role: "agent", ...data }]);
         } catch (err) {
-          setMessages(m => [...m, { role: "agent", answer: "Hata: " + err.message, success:false, steps:0, tool_calls:0, tools_used:[], total_tokens:0, duration_ms:0, trace:[] }]);
+          setMessages(m => [...m, { role: "agent", answer: "Hata: " + err.message, success:false, steps:0, tool_calls:0, tools_used:[], total_tokens:0, duration_ms:0, trace:[], images:[] }]);
         } finally {
           setLoading(false);
         }

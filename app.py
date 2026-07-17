@@ -23,6 +23,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 load_dotenv()
@@ -52,8 +53,35 @@ if str(SRC_DIR) not in sys.path:
 
 from plan_execute.agent import PlanExecuteAgent, build_detail_trace  # noqa: E402
 from plan_execute.config import settings  # noqa: E402
+from plan_execute.tools import CHARTS_DIR  # noqa: E402
 
 app = FastAPI(title="Plan-Execute Ajan — Sohbet")
+
+# Grafik araçları (plot_chart / visualize_data) PNG'yi diske yazıp yalnızca YOLUNU
+# döner. Tarayıcı diskten okuyamaz; bu yüzden charts dizinini statik olarak sunuyoruz
+# ve /api/chat cevabında dosya yolları -> /charts/<dosya> URL'lerine çevriliyor.
+os.makedirs(CHARTS_DIR, exist_ok=True)
+app.mount("/charts", StaticFiles(directory=CHARTS_DIR), name="charts")
+
+_PNG_RE = re.compile(r"[\w.\-]+\.png", re.IGNORECASE)
+
+
+def _collect_charts(rr) -> list[str]:
+    """Koşuda üretilen grafiklerin URL'lerini (sırayla, tekrarsız) toplar.
+
+    Araç çıktılarını ve nihai cevabı .png adı için tarar; SADECE basename kullanılır
+    ve CHARTS_DIR içinde gerçekten var mı diye bakılır — yani ne yol taşması olur ne
+    de modelin uydurduğu bir dosya adı URL'ye dönüşür.
+    """
+    urls: list[str] = []
+    texts = [str(ev.get("output") or "") for ev in rr.events if ev.get("kind") == "tool"]
+    texts.append(str(rr.answer or ""))
+    for text in texts:
+        for name in _PNG_RE.findall(text):
+            url = f"/charts/{name}"
+            if url not in urls and os.path.isfile(os.path.join(CHARTS_DIR, name)):
+                urls.append(url)
+    return urls
 
 # Başlangıçta aktif yapılandırmayı bas — "hangi model/endpoint'e gidiyorum?"
 # sorusu hata ayıklamanın yarısı. Anahtar ASLA loglanmaz, sadece var/yok.
@@ -111,6 +139,9 @@ def chat(body: ChatIn) -> dict:
         # Ayrıntılı, sıralı trace (test live-log'uyla AYNI format): plan başlığı +
         # her araç çağrısı (araç/girdi/çıktı/süre). UI'ın Step şekliyle uyumlu.
         trace = build_detail_trace(rr, obs_limit=2000)
+        images = _collect_charts(rr)
+        if images:
+            log.info("   🖼 grafik: %s", ", ".join(images))
         log.info("%s %s | adım=%d plan=%d replan=%d araç=%d (%s) token=%d süre=%.1fsn",
                  "✅" if rr.success else "⚠️", rr.status, rr.steps, rr.plan_steps,
                  rr.replan_count, rr.tool_calls, ", ".join(rr.tools_used) or "-",
@@ -125,6 +156,7 @@ def chat(body: ChatIn) -> dict:
             "total_tokens": rr.total_tokens,
             "duration_ms": int(rr.elapsed_seconds * 1000),
             "trace": trace,
+            "images": images,        # /charts/... — UI bunları doğrudan gösterir
         }
     except Exception as exc:  # noqa: BLE001 - UI'a temiz hata döndür
         # Terminale TAM traceback (teşhis için); UI'a yalnızca kısa mesaj.
@@ -139,6 +171,7 @@ def chat(body: ChatIn) -> dict:
             "total_tokens": 0,
             "duration_ms": 0,
             "trace": [],
+            "images": [],
         }
 
 
