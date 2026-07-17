@@ -37,9 +37,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Hiçbir env yoksa düşülecek son çare (HF Router; sağlayıcı deepinfra'ya sabit).
-DEFAULT_MODEL = "Qwen/Qwen3.5-122B-A10B:deepinfra"
-DEFAULT_BASE_URL = "https://router.huggingface.co/v1"
+
 
 
 def _first(*names: str) -> str | None:
@@ -56,8 +54,9 @@ class Settings:
     # provider: "openai" → OpenAI-uyumlu (base_url sağlayıcıyı seçer). Diğerleri
     # (google_genai, anthropic, groq, ...) init_chat_model ile native kurulur.
     provider: str = field(default_factory=lambda: (os.getenv("LLM_PROVIDER") or "openai").strip())
-    model_name: str = field(default_factory=lambda: _first("LLM_MODEL", "HF_MODEL") or DEFAULT_MODEL)
-    base_url: str | None = field(default_factory=lambda: _first("LLM_BASE_URL", "HF_BASE_URL") or DEFAULT_BASE_URL)
+    model_name: str = field(default_factory=lambda: _first("LLM_MODEL", "HF_MODEL") or "")
+    # Boş bırakılırsa ChatOpenAI kendi varsayılanına (api.openai.com) düşer.
+    base_url: str | None = field(default_factory=lambda: _first("LLM_BASE_URL", "HF_BASE_URL"))
     api_key: str | None = field(
         default_factory=lambda: _first(
             "LLM_API_KEY", "HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN",
@@ -97,6 +96,11 @@ def get_llm(**overrides):
         raise RuntimeError(
             "LLM API anahtarı bulunamadı. .env'e LLM_API_KEY=<anahtar> ekle "
             "(HF için HF_TOKEN da olur)."
+        )
+    if not settings.model_name:
+        raise RuntimeError(
+            "Model adı tanımlı değil. .env'e LLM_MODEL=<model> ekle "
+            "(ör. gpt-4o, gemini-2.5-flash, Qwen/Qwen3.5-122B-A10B:deepinfra)."
         )
 
     # Azure OpenAI: standart OpenAI'den ayrı (deployment + api-version + api-key

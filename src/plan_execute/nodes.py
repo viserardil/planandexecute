@@ -24,8 +24,9 @@ def _get_executor_agent():
 
 
 # Structured output VARSAYILAN (json_schema) yöntemle yapılır. Neden:
-#   - Sağlayıcı :deepinfra'ya sabitlendiği için json_schema destekleniyor (novita
-#     desteklemiyordu → 400; bkz config.DEFAULT_MODEL).
+#   - Seçilen model/sağlayıcı json_schema desteklemeli. (HF Router + Qwen kullanıyorsan
+#     model adını :deepinfra'ya sabitle; novita desteklemiyor → 400. Desteklemeyen bir
+#     sağlayıcıda LLM_STRUCTURED_METHOD=function_calling ile geçebilirsin.)
 #   - Replanner'ın Act şeması Union[Response, Plan] içerir; json_schema bu union'ı
 #     üretim anında ZORLAR ve güvenilir parse eder. function_calling ise union'da
 #     bazen 'action'a düz string koyup pydantic ValidationError'a yol açar (0/3).
