@@ -44,6 +44,14 @@ def _get_replanner():
     return REPLANNER_PROMPT | get_llm().with_structured_output(Act, **structured_output_kwargs())
 
 
+def _clip(value, limit: int) -> str:
+    """Uzun metni kırpar; kırpınca ham uzunluğu işaretler (kayıp görünür olsun)."""
+    text = str(value if value is not None else "")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"…[kesildi, ham {len(text)} kar]"
+
+
 def plan_step(state: PlanExecute) -> dict:
     """İlk kararı verir: araç gerekiyorsa PLAN üretir; gerekmiyorsa doğrudan
     CEVABI döndürür. İkinci durumda koşullu kenar (should_end) cevabı görüp
@@ -56,19 +64,55 @@ def plan_step(state: PlanExecute) -> dict:
     return {"plan": decision.steps or [state["input"]]}
 
 
+# Önceki adım sonuçları prompt'a eklenirken bu uzunlukta kırpılır. Amaç bağlamı
+# TAŞIMAK, veriyi tekrar etmek değil — araç gerekirse yeniden çağrılabilir.
+_PAST_RESULT_LIMIT = 800
+
+
 def execute_step(state: PlanExecute) -> dict:
-    """Plandaki ilk adımı ReAct alt-ajanıyla yürütür."""
+    """Plandaki ilk adımı ReAct alt-ajanıyla yürütür.
+
+    Alt-ajan her çağrıda SIFIRDAN kurulur; turlar arası hafızası yoktur. Bu yüzden
+    ihtiyaç duyacağı bağlam prompt'a AÇIKÇA konur: kullanıcının asıl isteği + o ana
+    kadar tamamlanmış adımların sonuçları. Aksi halde "elde edilen veriyle grafiği
+    çiz" gibi bir adımda hangi hisseden söz edildiğini bilemez ve kullanıcıya
+    "hangi sembol?" diye sorar — 55 vakalık koşuda 8 vakada (hepsi 2. adım ve
+    sonrasında) olan buydu; replanner sembolü adıma geri yazana kadar bir tur boşa
+    gidiyordu.
+    """
     plan = state["plan"]
     if not plan:  # emniyet: boş plan gelirse patlama, replanner karar versin
         return {}
     plan_str = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(plan))
     task = plan[0]
-    task_prompt = (
-        f"Şu plan için:\n{plan_str}\n\n"
-        f"1. adımı yürütmen isteniyor: {task}"
-    )
+
+    parts = [
+        f"Kullanıcının asıl isteği: {state['input']}",
+        "",
+        f"Plan:\n{plan_str}",
+    ]
+    past = state.get("past_steps") or []
+    if past:
+        done = "\n".join(
+            f"{i}. {step}\n   → {_clip(result, _PAST_RESULT_LIMIT)}"
+            for i, (step, result) in enumerate(past, 1)
+        )
+        parts += ["", f"Şimdiye kadar tamamlanan adımlar ve sonuçları:\n{done}"]
+    parts += [
+        "",
+        f"Şimdi şu adımı yürüt: {task}",
+        "Gereken bilgi (sembol, dönem, şirket vb.) yukarıdaki bağlamda varsa "
+        "kullanıcıya SORMA — doğrudan bağlamdan al ve adımı yürüt.",
+        # Adım disiplini: bağlam verilince alt-ajan planın tamamını tek turda
+        # bitirmeye eğilimli (gözlendi: 2 adımlık plan tek turda bitti,
+        # plan_steps 2→1). Bu, Plan-Execute'u davranışta ReAct'e yaklaştırır ve
+        # kıyasın "tek değişken mimari" ilkesini bozar. O yüzden açıkça sınırla.
+        "YALNIZCA bu adımı yürüt — plandaki sonraki adımlara GEÇME, onları "
+        "yapmaya çalışma. Bu adım bitince dur; sırayı replanner belirleyecek.",
+    ]
+
     agent_response = _get_executor_agent().invoke(
-        {"messages": [("user", task_prompt)]}
+        {"messages": [("user", "\n".join(parts))]}
     )
     result = agent_response["messages"][-1].content
     return {"past_steps": [(task, result)]}
