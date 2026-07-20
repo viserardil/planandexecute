@@ -1,32 +1,4 @@
-"""Merkezi konfigürasyon ve LLM fabrikası — SAĞLAYICI-BAĞIMSIZ.
 
-Amaç: HANGİ LLM sağlayıcısının anahtarını verirsen ver sistem çalışsın. İki yol:
-
-1) OpenAI-UYUMLU endpoint (VARSAYILAN — ekstra bağımlılık yok). Neredeyse tüm
-   sağlayıcılar bunu sunar; sadece üç şeyi ayarla: LLM_API_KEY, LLM_MODEL,
-   LLM_BASE_URL. Örnek base_url'ler:
-     OpenAI       : https://api.openai.com/v1
-     Gemini       : https://generativelanguage.googleapis.com/v1beta/openai/
-     Groq         : https://api.groq.com/openai/v1
-     Together     : https://api.together.xyz/v1
-     OpenRouter   : https://openrouter.ai/api/v1
-     DeepInfra    : https://api.deepinfra.com/v1/openai
-     HF Router    : https://router.huggingface.co/v1        (varsayılan)
-     Ollama/yerel : http://localhost:11434/v1               (api_key='ollama')
-
-2) NATIVE sağlayıcı (LLM_PROVIDER=google_genai | anthropic | groq | ...). Bunun
-   için o sağlayıcının LangChain paketini kurman gerekir (ör.
-   `uv add langchain-google-genai`). init_chat_model ile kurulur.
-
-Geriye dönük uyum: LLM_* yoksa eski HF_* değişkenleri kullanılır; hiçbir şey
-ayarlanmazsa HF Router + Qwen (deepinfra) varsayılanına düşer.
-
-Planner/executor/replanner HEPSİ bu tek fabrikayı kullanır; böylece karşılaştırmada
-tek değişken MİMARİ olur. NOT: Bu proje structured output (planner/replanner) ve
-tool-calling (executor) kullanır; seçtiğin sağlayıcı/model bunları desteklemeli.
-Sağlayıcı json_schema'yı desteklemiyorsa LLM_STRUCTURED_METHOD=function_calling
-(veya json_mode) dene.
-"""
 
 from __future__ import annotations
 
