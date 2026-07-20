@@ -23,6 +23,12 @@ def _now_iso() -> str:
 # başarısızlıkta tanınabilir Türkçe metinler döndürür.
 _TOOL_ERROR_MARKERS = ("HATA:", "hatası:", "kurulu değil", "Ağ hatası", "ayarlı değil")
 
+# Grafiğin KENDİ düğümleri. executor'ın içindeki create_react_agent alt-ajanı da
+# bir graftır ve onun iç düğümleri (agent/tools) de aynı callback'e düşer; bu
+# allowlist onları eler. Böylece alt-ajanın LLM/araç turları "executor" düğümüne
+# yazılır — hangi plan adımının içinde olduğumuz kaybolmaz.
+_GRAPH_NODES = frozenset({"planner", "executor", "replanner"})
+
 
 def _tool_ok(observation: str) -> bool:
     obs = (observation or "")[:80]
@@ -72,6 +78,10 @@ class MetricsCallback(BaseCallbackHandler):
         self.events: list[dict] = []
         self._llm_t0: dict = {}
         self._tool_t0: dict = {}
+        self._node_t0: dict = {}
+        # İçinde bulunulan graf düğümü — LLM/araç olaylarına iliştirilir ki
+        # log'da "bu tur planner'ın mı, executor'ın mı?" belli olsun.
+        self._current_node: str | None = None
         # Opsiyonel canlı kanca: her LLM/araç olayı bittiğinde çağrılır (vaka
         # içinde ilerleme göstermek için — ör. test live-log). Hata koşuyu düşürmez.
         self._on_event = on_event
@@ -82,6 +92,56 @@ class MetricsCallback(BaseCallbackHandler):
                 self._on_event(event)
             except Exception:
                 pass
+
+    # --- Graf düğümü sınırları (planner / executor / replanner) --------------
+    # DİKKAT: Düğüm olayları BİLEREK ``self.events``'e YAZILMAZ; yalnızca canlı
+    # kancaya (_emit) gider. events listesini run_schema ve build_detail_trace
+    # "llm ya da tool" varsayımıyla okuyor (kind != "llm" → tool). Araya üçüncü
+    # bir tür koymak a.json çıktısını — yani ReAct kıyasının ORTAK şemasını —
+    # bozardı. Düğüm bilgisi salt gözlem içindir, metriği değiştirmez.
+
+    def on_chain_start(self, serialized, inputs, *, run_id=None, tags=None,  # noqa: ANN001
+                       metadata=None, **kwargs) -> None:
+        node = (metadata or {}).get("langgraph_node")
+        # Koşullu kenar fonksiyonu (should_end) da düğümün metadata'sıyla gelir.
+        # Sadece düğümün KENDİ koşusunu al: adı langgraph_node ile aynı olan.
+        if node not in _GRAPH_NODES or kwargs.get("name") != node:
+            return
+        self._node_t0[run_id] = (time.perf_counter(), _now_iso(), node)
+        self._current_node = node
+        state = inputs if isinstance(inputs, dict) else {}
+        plan = list(state.get("plan") or [])
+        self._emit({
+            "kind": "node",
+            "phase": "start",
+            "name": node,
+            "plan": plan,
+            # executor her turda planın İLK adımını yürütür (bkz. nodes.execute_step).
+            "step": plan[0] if node == "executor" and plan else None,
+            "started_at": _now_iso(),
+        })
+
+    def on_chain_end(self, outputs, *, run_id=None, **kwargs) -> None:  # noqa: ANN001
+        entry = self._node_t0.pop(run_id, None)
+        if entry is None:
+            return  # bizim düğümümüz değil: graf kökü, alt-ajan zinciri ya da kenar
+        t0, started, node = entry
+        self._current_node = None
+        out = outputs if isinstance(outputs, dict) else {}
+        past = out.get("past_steps") or []
+        self._emit({
+            "kind": "node",
+            "phase": "end",
+            "name": node,
+            # Düğümün kararı: yeni/revize plan mı, nihai cevap mı, adım sonucu mu?
+            "plan": list(out.get("plan") or []),
+            "response": out.get("response"),
+            "step": past[-1][0] if past else None,
+            "result": past[-1][1] if past else None,
+            "started_at": started,
+            "ended_at": _now_iso(),
+            "duration_ms": round((time.perf_counter() - t0) * 1000, 3),
+        })
 
     # LLM zamanlaması: sohbet modelleri on_chat_model_start + on_llm_end kullanır.
     def on_chat_model_start(self, serialized, messages, *, run_id=None, **kwargs) -> None:  # noqa: ANN001
@@ -99,6 +159,7 @@ class MetricsCallback(BaseCallbackHandler):
         self.llm_calls += 1
         event = {
             "kind": "llm",
+            "node": self._current_node,   # hangi düğümün turu (salt gözlem)
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "text": text,
@@ -128,6 +189,7 @@ class MetricsCallback(BaseCallbackHandler):
         self.tools_used.append(name)
         event = {
             "kind": "tool",
+            "node": self._current_node,   # hangi düğümün içinde çağrıldı
             "name": name,
             "input": str(tool_input),
             "output": out,
@@ -148,6 +210,7 @@ class MetricsCallback(BaseCallbackHandler):
         self.tools_used.append(name)
         event = {
             "kind": "tool",
+            "node": self._current_node,
             "name": name,
             "input": str(tool_input),
             "output": str(error),

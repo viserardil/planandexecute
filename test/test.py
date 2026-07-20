@@ -222,7 +222,14 @@ class EvalRunner:
             # Canlı ilerleme: her LLM/araç olayı bittiğinde live-log'a satır düş
             # (vaka İÇİNDE görünürlük — "donmuş mu" belirsizliğini önler).
             def _live_event(ev):
-                if ev.get("kind") == "tool":
+                kind = ev.get("kind")
+                if kind == "node":
+                    # Düğüm sınırı olayları (planner/executor/replanner kararları)
+                    # sohbet arayüzünün oturum log'u için üretiliyor. Burada plan
+                    # zaten vaka sonunda topluca yazılıyor — atla ki "LLM turu"
+                    # diye yanlış etiketlenmesin.
+                    return
+                if kind == "tool":
                     mark = "✅" if ev.get("success", True) else "❌"
                     self._live(f"        · {ev.get('name')}({_one_line(str(ev.get('input', '')), 70)}) "
                                f"{mark} {ev.get('duration_ms', 0):.0f}ms")

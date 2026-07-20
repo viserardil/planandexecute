@@ -226,6 +226,36 @@ uv run python app.py          # → http://127.0.0.1:8000   (PORT / HOST env ile
 - Cevabın altında **"adımları göster"** ile plan + araç çağrılarının ayrıntısı görünür
   (test live-log'uyla aynı format).
 
+### Oturum log'ları
+
+Her sohbet (thread) **kendi log dosyasına** yazar: `logs/<thread_id>.log`
+(dizin `LOG_DIR` ile değişir). Terminalde yalnızca kısa özet kalır; adım adım tam
+akış dosyaya iner — paralel sohbetler birbirine karışmaz ve koşu bittikten sonra da
+incelenebilir. Dosya canlı güncellenir, `tail -f` ile izlenebilir.
+
+Log grafiğin akışını olduğu gibi gösterir: planner'ın **ürettiği plan**, executor'ın
+o an **yürüttüğü adım** + sonucu, replanner'ın **"devam mı bitir mi"** kararı, her LLM
+turunun ham çıktısı (`💭` — planner/replanner'da structured output JSON'ı, executor'da
+düz akıl yürütme) ve her araç çağrısı (girdi/çıktı/süre).
+
+```
+🧠 PLANNER ✓ PLAN üretildi — 2 adım (6.0sn):
+      1. Apple hissesinin sembolünü belirle (resolve_ticker).
+      2. Apple hissesinin güncel fiyatını getir (get_current_stock_price).
+⚙️  EXECUTOR ▶ adım yürütülüyor (planda 2 adım kaldı):
+      → Apple hissesinin sembolünü belirle (resolve_ticker).
+      · [executor] LLM turu (1.0sn, +16 tok)
+      · resolve_ticker(Apple) ✅ 7563ms
+           → 'Apple' için bulunan semboller: AAPL — Apple Inc. (NMS) …
+⚙️  EXECUTOR ✓ adım tamamlandı (10.2sn)
+🔁 REPLANNER ✓ karar: DEVAM — plan revize edildi — 1 adım (1.0sn):
+      1. Apple hissesinin güncel fiyatını getir (get_current_stock_price).
+```
+
+> Düğüm olayları (planner/executor/replanner sınırları) `MetricsCallback`'in canlı
+> kancasından gelir; **metriklere ve `a.json` çıktısına karışmaz** — yani ReAct
+> kıyasının ortak şeması bu log'dan etkilenmez.
+
 ---
 
 ## Toplanan metrikler

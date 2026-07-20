@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -28,10 +29,14 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-# --- Terminal log'u ---------------------------------------------------------
-# Her istekte: soru → her LLM turu / araç çağrısı (canlı) → özet; hatada TAM
-# traceback. Sorun çıktığında terminalden ne olduğunu görebilmek için.
-# Sessizleştirmek istersen: LOG_LEVEL=WARNING
+# --- Log'lama ---------------------------------------------------------------
+# İKİ KATMAN:
+#   1) Terminal — yalnızca kısa özet (başladı / bitti + hata traceback'i).
+#   2) Oturum dosyası — logs/<thread_id>.log: adım adım TAM akış (plan, her
+#      düğümün kararı, model düşüncesi, araç çağrıları). Her sohbet kendi
+#      dosyasına yazar; paralel sohbetler birbirine karışmaz ve koşu bittikten
+#      sonra da incelenebilir.
+# Ayarlar: LOG_LEVEL (varsayılan INFO) · LOG_DIR (varsayılan <proje>/logs)
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s  %(message)s",
@@ -45,9 +50,94 @@ def _one(value, limit=160):
     text = re.sub(r"\s+", " ", str(value if value is not None else "")).strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
+
+# thread_id İSTEK GÖVDESİNDEN gelir (dışarıdan kontrol edilir); dosya adına
+# girmeden önce ayraç/nokta içermeyen bir alt kümeye indirilir — aksi halde
+# "../x" gibi bir değer log dizininin dışına yazabilirdi.
+_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9_-]")
+_session_loggers: dict[str, logging.Logger] = {}
+_session_lock = threading.Lock()
+
+
+def _session_logger(thread_id) -> logging.Logger:
+    """thread_id'ye özgü dosya logger'ı — ilk çağrıda kurulur, sonra önbellekten.
+
+    propagate=False: oturum ayrıntısı terminale TEKRAR basılmaz (terminalde
+    yalnızca özet kalsın diye).
+    """
+    safe = _UNSAFE_NAME.sub("_", str(thread_id or ""))[:64] or "anon"
+    with _session_lock:
+        logger = _session_loggers.get(safe)
+        if logger is not None:
+            return logger
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger(f"plan-execute.session.{safe}")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        handler = logging.FileHandler(LOG_DIR / f"{safe}.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%H:%M:%S"))
+        logger.addHandler(handler)
+        logger.info("=" * 72)
+        logger.info("OTURUM %s · başladı %s", safe, time.strftime("%Y-%m-%d %H:%M:%S"))
+        logger.info("model=%s · endpoint=%s",
+                    settings.model_name or "(TANIMSIZ!)",
+                    settings.base_url or "(sağlayıcı varsayılanı)")
+        logger.info("(bu dosya canlı güncellenir — `tail -f` ile izleyebilirsin)")
+        logger.info("=" * 72)
+        _session_loggers[safe] = logger
+        return logger
+
+
+# Graf düğümlerinin log etiketleri.
+_NODE_LABEL = {
+    "planner": "🧠 PLANNER",
+    "executor": "⚙️  EXECUTOR",
+    "replanner": "🔁 REPLANNER",
+}
+
+
+def _log_node(slog: logging.Logger, ev: dict) -> None:
+    """Bir düğümün başlangıcını/kararını yazar.
+
+    Akışın iskeleti bu: planner'ın ürettiği plan, executor'ın o an yürüttüğü
+    adım ve sonucu, replanner'ın 'devam mı bitir mi' kararı.
+    """
+    name = ev.get("name")
+    label = _NODE_LABEL.get(name, str(name))
+
+    if ev.get("phase") == "start":
+        if name == "executor":
+            kalan = len(ev.get("plan") or [])
+            slog.info("%s ▶ adım yürütülüyor (planda %d adım kaldı):", label, kalan)
+            slog.info("      → %s", _one(ev.get("step"), 300))
+        else:
+            slog.info("%s ▶ düşünüyor…", label)
+        return
+
+    # phase == "end" → düğümün kararı
+    saniye = ev.get("duration_ms", 0) / 1000
+    if ev.get("response"):
+        if name == "planner":
+            slog.info("%s ✓ araç GEREKMEZ → doğrudan cevap (%.1fsn)", label, saniye)
+        else:
+            slog.info("%s ✓ karar: BİTİR — nihai cevap hazır (%.1fsn)", label, saniye)
+        slog.info("      → %s", _one(ev["response"], 400))
+    elif ev.get("plan"):
+        plan = ev["plan"]
+        baslik = "PLAN üretildi" if name == "planner" else "karar: DEVAM — plan revize edildi"
+        slog.info("%s ✓ %s — %d adım (%.1fsn):", label, baslik, len(plan), saniye)
+        for i, step in enumerate(plan, 1):
+            slog.info("      %d. %s", i, _one(step, 300))
+    elif ev.get("result") is not None:
+        slog.info("%s ✓ adım tamamlandı (%.1fsn)", label, saniye)
+        slog.info("      sonuç: %s", _one(ev["result"], 600))
+
 # src/ layout: paket kurulu olmasa da import edilebilsin.
 ROOT = Path(__file__).resolve().parent
 SRC_DIR = ROOT / "src"
+
+# Oturum log'larının yazılacağı dizin (yukarıdaki _session_logger kullanır).
+LOG_DIR = Path(os.getenv("LOG_DIR") or (ROOT / "logs"))
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
@@ -88,6 +178,7 @@ def _collect_charts(rr) -> list[str]:
 log.info("Yapılandırma: model=%s · endpoint=%s · anahtar=%s · timeout=%ss · retry=%s",
          settings.model_name or "(TANIMSIZ!)", settings.base_url or "(sağlayıcı varsayılanı)",
          "var" if settings.api_key else "YOK!", settings.timeout, settings.max_retries)
+log.info("Oturum log'ları: %s  (her sohbet kendi <thread_id>.log dosyasına yazar)", LOG_DIR)
 
 # Tek ajan örneği: graf kurulumu tembel LLM kullandığı için HF_TOKEN olmadan da
 # oluşturulur (token yalnızca çalıştırma anında gerekir). _memory turlar arası
@@ -121,19 +212,35 @@ def chat(body: ChatIn) -> dict:
     kırılmadan gösterebilsin. Her adım ayrıca terminale loglanır (teşhis için).
     """
     t0 = time.time()
+    slog = _session_logger(body.thread_id)
     log.info("▶ [%s] SORU: %s", body.thread_id or "-", _one(body.message, 140))
+    slog.info("")
+    slog.info("─" * 72)
+    slog.info("▶ SORU: %s", _one(body.message, 500))
+    slog.info("─" * 72)
     try:
-        # Canlı adım log'u: her LLM turu / araç çağrısı bitince terminale düşer.
+        # Canlı adım log'u — oturum dosyasına, olay bitince anında.
+        # Üç tür olay: düğüm sınırı (plan/karar), LLM turu (düşünce), araç çağrısı.
         def _log_event(ev):
-            if ev.get("kind") == "tool":
+            kind = ev.get("kind")
+            if kind == "node":
+                _log_node(slog, ev)
+            elif kind == "tool":
                 mark = "✅" if ev.get("success", True) else "❌"
-                log.info("   · %s(%s) %s %.0fms", ev.get("name"),
-                         _one(ev.get("input", ""), 60), mark, ev.get("duration_ms", 0))
+                slog.info("      · %s(%s) %s %.0fms", ev.get("name"),
+                          _one(ev.get("input", ""), 100), mark, ev.get("duration_ms", 0))
                 if ev.get("output"):
-                    log.info("        → %s", _one(ev["output"], 180))
-            else:
-                log.info("   · … LLM turu (%.1fsn, +%d tok)",
-                         ev.get("duration_ms", 0) / 1000, ev.get("output_tokens", 0))
+                    slog.info("           → %s", _one(ev["output"], 400))
+            else:  # llm turu
+                slog.info("      · [%s] LLM turu (%.1fsn, +%d tok)",
+                          ev.get("node") or "-", ev.get("duration_ms", 0) / 1000,
+                          ev.get("output_tokens", 0))
+                # Modelin bu turdaki ham çıktısı = scratchpad. planner/replanner'da
+                # bu, structured output'un JSON'ı olur (kararın kendisi görünür);
+                # executor'ın ReAct alt-ajanında ise düz akıl yürütme metnidir.
+                thought = (ev.get("text") or "").strip()
+                if thought:
+                    slog.info("        💭 %s", _one(thought, 500))
 
         rr = agent.run(body.message, thread_id=body.thread_id, on_event=_log_event)
         # Ayrıntılı, sıralı trace (test live-log'uyla AYNI format): plan başlığı +
@@ -141,12 +248,15 @@ def chat(body: ChatIn) -> dict:
         trace = build_detail_trace(rr, obs_limit=2000)
         images = _collect_charts(rr)
         if images:
-            log.info("   🖼 grafik: %s", ", ".join(images))
-        log.info("%s %s | adım=%d plan=%d replan=%d araç=%d (%s) token=%d süre=%.1fsn",
-                 "✅" if rr.success else "⚠️", rr.status, rr.steps, rr.plan_steps,
-                 rr.replan_count, rr.tool_calls, ", ".join(rr.tools_used) or "-",
-                 rr.total_tokens, rr.elapsed_seconds)
-        log.info("   CEVAP: %s", _one(rr.answer, 200))
+            slog.info("   🖼 grafik: %s", ", ".join(images))
+        ozet = ("%s %s | adım=%d plan=%d replan=%d araç=%d (%s) token=%d süre=%.1fsn" % (
+            "✅" if rr.success else "⚠️", rr.status, rr.steps, rr.plan_steps,
+            rr.replan_count, rr.tool_calls, ", ".join(rr.tools_used) or "-",
+            rr.total_tokens, rr.elapsed_seconds))
+        # Özet iki yere de: terminalde tek satırlık durum, dosyada tam cevapla.
+        log.info("%s", ozet)
+        slog.info("%s", ozet)
+        slog.info("CEVAP: %s", _one(rr.answer, 2000))
         return {
             "answer": rr.answer,
             "success": rr.success,
@@ -159,9 +269,12 @@ def chat(body: ChatIn) -> dict:
             "images": images,        # /charts/... — UI bunları doğrudan gösterir
         }
     except Exception as exc:  # noqa: BLE001 - UI'a temiz hata döndür
-        # Terminale TAM traceback (teşhis için); UI'a yalnızca kısa mesaj.
+        # TAM traceback hem terminale hem oturum dosyasına (teşhis için);
+        # UI'a yalnızca kısa mesaj.
         log.exception("❌ HATA (%.1fsn sonra) — %s: %s",
                       time.time() - t0, type(exc).__name__, exc)
+        slog.exception("❌ HATA (%.1fsn sonra) — %s: %s",
+                       time.time() - t0, type(exc).__name__, exc)
         return {
             "answer": f"Hata: {type(exc).__name__}: {exc}",
             "success": False,
@@ -180,6 +293,8 @@ def reset(body: ResetIn) -> dict:
     """Bir thread'in kısa süreli belleğini siler ('Temizle' butonu)."""
     removed = agent.reset_memory(body.thread_id) if body.thread_id else False
     log.info("🗑 bellek sıfırlandı [%s] → %s", body.thread_id or "-", removed)
+    _session_logger(body.thread_id).info(
+        "🗑 BELLEK SIFIRLANDI (silinecek geçmiş var mıydı: %s)", removed)
     return {"ok": True, "removed": removed}
 
 
